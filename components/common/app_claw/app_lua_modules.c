@@ -104,6 +104,9 @@
 #if CONFIG_APP_CLAW_LUA_MODULE_LCD_TOUCH && defined(CONFIG_ESP_BOARD_DEV_LCD_TOUCH_SUPPORT) && defined(CONFIG_ESP_BOARD_DEV_LCD_TOUCH_SUB_I2C_SUPPORT)
 #include "lua_module_lcd_touch.h"
 #endif
+#if CONFIG_APP_CLAW_LUA_MODULE_LEDC
+#include "lua_module_ledc.h"
+#endif
 #if CONFIG_APP_CLAW_LUA_MODULE_LED_STRIP
 #include "lua_module_led_strip.h"
 #endif
@@ -552,6 +555,14 @@ static esp_err_t app_lua_register_lcd_touch(const char *fatfs_base_path)
 }
 #endif
 
+#if CONFIG_APP_CLAW_LUA_MODULE_LEDC
+static esp_err_t app_lua_register_ledc(const char *fatfs_base_path)
+{
+    (void)fatfs_base_path;
+    return lua_module_ledc_register();
+}
+#endif
+
 #if CONFIG_APP_CLAW_LUA_MODULE_LED_STRIP
 static esp_err_t app_lua_register_led_strip(const char *fatfs_base_path)
 {
@@ -697,6 +708,9 @@ static const app_lua_module_entry_t s_lua_module_entries[] = {
 #if CONFIG_APP_CLAW_LUA_MODULE_LCD_TOUCH && defined(CONFIG_ESP_BOARD_DEV_LCD_TOUCH_SUPPORT) && defined(CONFIG_ESP_BOARD_DEV_LCD_TOUCH_SUB_I2C_SUPPORT)
     { "lcd_touch", "LCD Touch", app_lua_register_lcd_touch },
 #endif
+#if CONFIG_APP_CLAW_LUA_MODULE_LEDC
+    { "ledc", "LEDC", app_lua_register_ledc },
+#endif
 #if CONFIG_APP_CLAW_LUA_MODULE_LED_STRIP
     { "led_strip", "LED Strip", app_lua_register_led_strip },
 #endif
@@ -809,6 +823,9 @@ static const app_lua_module_info_t s_lua_module_infos[] = {
 #endif
 #if CONFIG_APP_CLAW_LUA_MODULE_LCD_TOUCH && defined(CONFIG_ESP_BOARD_DEV_LCD_TOUCH_SUPPORT) && defined(CONFIG_ESP_BOARD_DEV_LCD_TOUCH_SUB_I2C_SUPPORT)
     { "lcd_touch", "LCD Touch" },
+#endif
+#if CONFIG_APP_CLAW_LUA_MODULE_LEDC
+    { "ledc", "LEDC" },
 #endif
 #if CONFIG_APP_CLAW_LUA_MODULE_LED_STRIP
     { "led_strip", "LED Strip" },
