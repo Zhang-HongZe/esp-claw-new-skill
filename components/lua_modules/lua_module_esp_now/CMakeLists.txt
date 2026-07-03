@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "src/lua_module_esp_now.c"
+    INCLUDE_DIRS
+        "src"
+    REQUIRES
+        cap_lua
+        esp_wifi
+        freertos
+)
