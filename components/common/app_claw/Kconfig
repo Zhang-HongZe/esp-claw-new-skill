@@ -475,6 +475,16 @@ menu "App Claw Config"
                 Enable the system Lua module and keep app_claw's direct dependency
                 on lua_module_system when Lua capability is enabled.
 
+        config APP_CLAW_LUA_MODULE_MOTION_DETECT
+            bool "Enable motion_detect Lua module"
+            depends on ESP_BOARD_DEV_CAMERA_SUPPORT
+            depends on APP_CLAW_LUA_MODULE_IMAGE
+            default y
+            help
+                Enable the standalone motion_detect Lua module. It ports the
+                block-based frame-difference detector from lcd_ai_detect and
+                registers require("motion_detect").
+
         config APP_CLAW_LUA_MODULE_VISION
             bool "Enable vision Lua modules"
             depends on ESP_BOARD_DEV_CAMERA_SUPPORT

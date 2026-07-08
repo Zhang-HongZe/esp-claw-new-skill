@@ -116,6 +116,9 @@
 #if CONFIG_APP_CLAW_LUA_MODULE_MAGNETOMETER
 #include "lua_module_magnetometer.h"
 #endif
+#if CONFIG_APP_CLAW_LUA_MODULE_MOTION_DETECT && defined(CONFIG_ESP_BOARD_DEV_CAMERA_SUPPORT)
+#include "lua_module_motion_detect.h"
+#endif
 #if CONFIG_APP_CLAW_LUA_MODULE_SCI
 #include "lua_module_sci.h"
 #endif
@@ -586,6 +589,14 @@ static esp_err_t app_lua_register_magnetometer(const char *fatfs_base_path)
 }
 #endif
 
+#if CONFIG_APP_CLAW_LUA_MODULE_MOTION_DETECT && defined(CONFIG_ESP_BOARD_DEV_CAMERA_SUPPORT)
+static esp_err_t app_lua_register_motion_detect(const char *fatfs_base_path)
+{
+    (void)fatfs_base_path;
+    return lua_module_motion_detect_register();
+}
+#endif
+
 #if CONFIG_APP_CLAW_LUA_MODULE_SCI
 static esp_err_t app_lua_register_sci(const char *fatfs_base_path)
 {
@@ -720,6 +731,9 @@ static const app_lua_module_entry_t s_lua_module_entries[] = {
 #if CONFIG_APP_CLAW_LUA_MODULE_MAGNETOMETER
     { "magnetometer", "Magnetometer", app_lua_register_magnetometer },
 #endif
+#if CONFIG_APP_CLAW_LUA_MODULE_MOTION_DETECT && defined(CONFIG_ESP_BOARD_DEV_CAMERA_SUPPORT)
+    { "motion_detect", "Motion Detect", app_lua_register_motion_detect },
+#endif
 #if CONFIG_APP_CLAW_LUA_MODULE_SCI
     { "sci", "DFRobot SCI", app_lua_register_sci },
 #endif
@@ -835,6 +849,9 @@ static const app_lua_module_info_t s_lua_module_infos[] = {
 #endif
 #if CONFIG_APP_CLAW_LUA_MODULE_MAGNETOMETER
     { "magnetometer", "Magnetometer" },
+#endif
+#if CONFIG_APP_CLAW_LUA_MODULE_MOTION_DETECT && defined(CONFIG_ESP_BOARD_DEV_CAMERA_SUPPORT)
+    { "motion_detect", "Motion Detect" },
 #endif
 #if CONFIG_APP_CLAW_LUA_MODULE_SCI
     { "sci", "DFRobot SCI" },

@@ -15,6 +15,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "lauxlib.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 
@@ -24,6 +25,19 @@
 #define LUA_MODULE_LEDC_DEFAULT_DUTY_RES_BITS 14
 #define LUA_MODULE_LEDC_MIN_DUTY_RES_BITS 1
 #define LUA_MODULE_LEDC_MAX_DUTY_RES_BITS 14
+
+#if CONFIG_ESP_BOARD_DEV_CAMERA_SUPPORT
+/*
+ * Some board-manager camera devices generate sensor XCLK with LEDC timer0 /
+ * channel0 before Lua starts. The Lua-side allocator cannot see that external
+ * ownership, so keep dynamic Lua PWM handles away from slot 0 on camera boards.
+ */
+#define LUA_MODULE_LEDC_FIRST_DYNAMIC_CHANNEL 1
+#define LUA_MODULE_LEDC_FIRST_DYNAMIC_TIMER 1
+#else
+#define LUA_MODULE_LEDC_FIRST_DYNAMIC_CHANNEL 0
+#define LUA_MODULE_LEDC_FIRST_DYNAMIC_TIMER 0
+#endif
 
 static const char *TAG = "lua_module_ledc";
 static portMUX_TYPE s_ledc_alloc_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -93,7 +107,7 @@ static esp_err_t lua_module_ledc_alloc_channel(ledc_channel_t *out_channel)
     int selected = -1;
 
     portENTER_CRITICAL(&s_ledc_alloc_mux);
-    for (int i = 0; i < LEDC_CHANNEL_MAX; ++i) {
+    for (int i = LUA_MODULE_LEDC_FIRST_DYNAMIC_CHANNEL; i < LEDC_CHANNEL_MAX; ++i) {
         if (!s_channel_in_use[i]) {
             s_channel_in_use[i] = true;
             selected = i;
@@ -130,7 +144,7 @@ static esp_err_t lua_module_ledc_acquire_timer(ledc_mode_t speed_mode,
     bool needs_config = false;
 
     portENTER_CRITICAL(&s_ledc_alloc_mux);
-    for (int i = 0; i < LEDC_TIMER_MAX; ++i) {
+    for (int i = LUA_MODULE_LEDC_FIRST_DYNAMIC_TIMER; i < LEDC_TIMER_MAX; ++i) {
         if (lua_module_ledc_timer_slot_matches(&s_timer_slots[i],
                                                speed_mode,
                                                duty_resolution,
@@ -142,7 +156,7 @@ static esp_err_t lua_module_ledc_acquire_timer(ledc_mode_t speed_mode,
     }
 
     if (slot_index < 0) {
-        for (int i = 0; i < LEDC_TIMER_MAX; ++i) {
+        for (int i = LUA_MODULE_LEDC_FIRST_DYNAMIC_TIMER; i < LEDC_TIMER_MAX; ++i) {
             if (!s_timer_slots[i].in_use) {
                 s_timer_slots[i] = (lua_module_ledc_timer_slot_t) {
                     .in_use = true,

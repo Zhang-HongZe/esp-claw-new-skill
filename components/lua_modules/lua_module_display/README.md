@@ -333,6 +333,7 @@ Lua string copy caused by `frame:data()`.
 - `mode`: `"raw"`, `"fit"`, `"cover"`, `"stretch"`, or `"crop"`; default is `"raw"`
 - `width`, `height`: destination size for fit/cover/stretch/crop modes
 - `source`: `{ x, y, width, height }` source rectangle for crop/cover modes
+- `flip_y`: boolean, vertically flip the selected source pixels before drawing in crop/cover modes
 
 Examples:
 
@@ -348,6 +349,7 @@ display.draw_image(0, 0, frame, {
     source = { x = 20, y = 20, width = 160, height = 120 },
     width = 320,
     height = 240,
+    flip_y = true,
 })
 ```
 

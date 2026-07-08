@@ -473,6 +473,7 @@ typedef struct {
     int src_y;
     int src_w;
     int src_h;
+    bool flip_y;
 } lua_display_image_options_t;
 
 static bool lua_display_get_table_integer(lua_State *L, int table_idx, const char *name, int *out)
@@ -485,6 +486,19 @@ static bool lua_display_get_table_integer(lua_State *L, int table_idx, const cha
         ok = true;
     } else if (lua_isnumber(L, -1)) {
         *out = (int)lua_tonumber(L, -1);
+        ok = true;
+    }
+    lua_pop(L, 1);
+    return ok;
+}
+
+static bool lua_display_get_table_bool(lua_State *L, int table_idx, const char *name, bool *out)
+{
+    bool ok = false;
+
+    lua_getfield(L, table_idx, name);
+    if (lua_isboolean(L, -1)) {
+        *out = lua_toboolean(L, -1);
         ok = true;
     }
     lua_pop(L, 1);
@@ -558,6 +572,7 @@ static void lua_display_parse_image_options(lua_State *L, int opts_idx, int src_
     opts->mode = lua_display_parse_image_mode(L, opts_idx, "draw_image");
     lua_display_get_table_integer(L, opts_idx, "width", &opts->dst_w);
     lua_display_get_table_integer(L, opts_idx, "height", &opts->dst_h);
+    lua_display_get_table_bool(L, opts_idx, "flip_y", &opts->flip_y);
     lua_display_parse_source_rect(L, opts_idx, opts);
 }
 
@@ -605,7 +620,8 @@ static esp_err_t lua_display_draw_pixels_fit_data(int x, int y, int src_width, i
     return display_hal_draw_bitmap_scaled(x, y, data, src_width, src_height, scale_w, scale_h, out_w, out_h);
 }
 
-static esp_err_t lua_display_copy_rgb565_crop(const uint16_t *src, int src_width, int src_x, int src_y, int crop_w, int crop_h, uint16_t **out)
+static esp_err_t lua_display_copy_rgb565_crop(const uint16_t *src, int src_width, int src_x, int src_y,
+                                              int crop_w, int crop_h, bool flip_y, uint16_t **out)
 {
     uint16_t *crop = NULL;
 
@@ -618,7 +634,8 @@ static esp_err_t lua_display_copy_rgb565_crop(const uint16_t *src, int src_width
         return ESP_ERR_NO_MEM;
     }
     for (int row = 0; row < crop_h; row++) {
-        const uint16_t *src_row = src + ((size_t)(src_y + row) * src_width) + src_x;
+        int source_row = flip_y ? (crop_h - 1 - row) : row;
+        const uint16_t *src_row = src + ((size_t)(src_y + source_row) * src_width) + src_x;
         memcpy(crop + ((size_t)row * crop_w), src_row, (size_t)crop_w * sizeof(uint16_t));
     }
     *out = crop;
@@ -685,15 +702,21 @@ static int lua_display_draw_image(lua_State *L)
                 src_h = new_h;
             }
         }
-        if (src_w == opts.dst_w && src_h == opts.dst_h) {
+        if (!opts.flip_y && src_w == opts.dst_w && src_h == opts.dst_h) {
             err = display_hal_draw_bitmap_crop(x, y, src_x, src_y, src_w, src_h, view.width, view.height, pixels);
             out_w = src_w;
             out_h = src_h;
             break;
         }
-        err = lua_display_copy_rgb565_crop(pixels, view.width, src_x, src_y, src_w, src_h, &crop);
+        err = lua_display_copy_rgb565_crop(pixels, view.width, src_x, src_y, src_w, src_h, opts.flip_y, &crop);
         if (err == ESP_OK) {
-            err = display_hal_draw_bitmap_scaled(x, y, crop, src_w, src_h, opts.dst_w, opts.dst_h, &out_w, &out_h);
+            if (src_w == opts.dst_w && src_h == opts.dst_h) {
+                err = display_hal_draw_bitmap(x, y, src_w, src_h, crop);
+                out_w = src_w;
+                out_h = src_h;
+            } else {
+                err = display_hal_draw_bitmap_scaled(x, y, crop, src_w, src_h, opts.dst_w, opts.dst_h, &out_w, &out_h);
+            }
         }
         free(crop);
         break;
@@ -791,7 +814,8 @@ static esp_err_t lua_display_draw_pixels_data(int x, int y, const uint16_t *pixe
         const uint16_t *src_pixels = pixels;
 
         if (!lua_display_pixels_source_is_full(opts)) {
-            err = lua_display_copy_rgb565_crop(pixels, opts->full_w, opts->src_x, opts->src_y, opts->src_w, opts->src_h, &crop);
+            err = lua_display_copy_rgb565_crop(pixels, opts->full_w, opts->src_x, opts->src_y,
+                                               opts->src_w, opts->src_h, false, &crop);
             if (err != ESP_OK) {
                 break;
             }
@@ -806,7 +830,8 @@ static esp_err_t lua_display_draw_pixels_data(int x, int y, const uint16_t *pixe
         const uint16_t *src_pixels = pixels;
 
         if (!lua_display_pixels_source_is_full(opts)) {
-            err = lua_display_copy_rgb565_crop(pixels, opts->full_w, opts->src_x, opts->src_y, opts->src_w, opts->src_h, &crop);
+            err = lua_display_copy_rgb565_crop(pixels, opts->full_w, opts->src_x, opts->src_y,
+                                               opts->src_w, opts->src_h, false, &crop);
             if (err != ESP_OK) {
                 break;
             }
@@ -849,7 +874,7 @@ static esp_err_t lua_display_draw_pixels_data(int x, int y, const uint16_t *pixe
             }
             break;
         }
-        err = lua_display_copy_rgb565_crop(pixels, opts->full_w, src_x, src_y, src_w, src_h, &crop);
+        err = lua_display_copy_rgb565_crop(pixels, opts->full_w, src_x, src_y, src_w, src_h, false, &crop);
         if (err == ESP_OK) {
             err = display_hal_draw_bitmap_scaled(x, y, crop, src_w, src_h, dst_w, dst_h, out_w, out_h);
         }
