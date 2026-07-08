@@ -2,7 +2,8 @@
 
 This module describes how to correctly use BLE HID when writing Lua scripts.
 It exposes the device as a composite BLE HID peripheral with media control,
-keyboard, and mouse input reports.
+keyboard, and mouse input reports, plus one vendor-defined output report that
+a connected HID host can use to send commands to Lua.
 
 ## How to call
 - Import it with `local ble_hid = require("ble_hid")`
@@ -18,6 +19,7 @@ keyboard, and mouse input reports.
 - Call `ble_hid.mouse_scroll(wheel [, pan])` to scroll vertically or horizontally
 - Call `ble_hid.mouse_button(button [, gesture])` to click, press, or release a mouse button
 - Call `ble_hid.release_all()` before stopping or after interrupted pointer/key actions
+- Call `event, err = ble_hid.receive([timeout_ms])` to receive the next 5-byte vendor output report
 - Call `ble_hid.stop()` to stop advertising, and `ble_hid.deinit()` to release the HID stack
 
 `init` and `start` accept an optional `name` field. The name length must be 29
@@ -109,6 +111,13 @@ correction.
 Most operations return `true` on success. Runtime failures return `nil, err`.
 Argument validation errors raise Lua errors.
 
+`ble_hid.receive(timeout_ms)` returns a table containing `report_id` and binary
+string `data`. It returns `nil, "timeout"` when no vendor control packet arrives
+before the non-negative timeout. The receive queue keeps the newest eight
+reports and drops the oldest report on overflow. Packets can arrive either from
+the legacy HID vendor output report or from the private gimbal GATT control
+characteristic.
+
 Typical failures are:
 - `HID not initialized`: call `ble_hid.init()` first
 - `not connected`: pair and connect from the host before sending reports
@@ -116,10 +125,15 @@ Typical failures are:
 
 ## HID Reports
 
-The module owns one BLE HID service with three input reports:
+The module owns one BLE HID service with three input reports and one output
+report, plus one private GATT control service for gimbal packets:
+
 - Consumer Control: report ID `1`, 1 byte
 - Keyboard: report ID `2`, 8 bytes, `modifier + reserved + 6 keycodes`
 - Mouse: report ID `3`, 5 bytes, `buttons + x + y + wheel + horizontal pan`
+- Vendor output: report ID `4`, exactly 5 bytes
+- Gimbal GATT service: `f7c10001-b5a3-f393-e0a9-e50e24dcca9e`
+- Gimbal control characteristic: `f7c10002-b5a3-f393-e0a9-e50e24dcca9e`, exactly 5 bytes
 
 The C implementation sends report payload bytes with:
 

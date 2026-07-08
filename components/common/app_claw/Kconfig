@@ -293,13 +293,15 @@ menu "App Claw Config"
 
         config APP_CLAW_LUA_MODULE_BLE_HID
             bool "Enable BLE HID Lua module"
+            default y if BT_ENABLED
             default n
-            depends on APP_CLAW_CAP_LUA
+            depends on APP_CLAW_CAP_LUA && BT_ENABLED
             select BT_NIMBLE_HID_SERVICE
             help
                 Enable the BLE HID Lua module for Consumer Control, Keyboard, Mouse,
-                and local HID behavior. This module owns its BLE HID runtime via
-                ESP-IDF NimBLE and esp_hidd, and exposes the ble_hid.* behavior APIs.
+                vendor output reports, and local HID behavior. This module owns its
+                BLE HID runtime via ESP-IDF NimBLE and esp_hidd, and exposes the
+                ble_hid.* behavior APIs.
                 Do not start the generic BLE Lua module advertising while BLE HID is
                 running.
 

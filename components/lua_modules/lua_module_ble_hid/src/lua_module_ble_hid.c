@@ -15,18 +15,23 @@
 #include "esp_hidd.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "host/ble_att.h"
 #include "host/ble_gap.h"
+#include "host/ble_gatt.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_adv.h"
 #include "host/ble_hs_id.h"
 #include "host/ble_store.h"
+#include "host/ble_uuid.h"
 #include "host/util/util.h"
 #include "lauxlib.h"
 #include "lua.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
+#include "os/os_mbuf.h"
 #include "sdkconfig.h"
 #include "services/gap/ble_svc_gap.h"
 
@@ -37,10 +42,15 @@
 #define REPORT_ID_CONSUMER 1
 #define REPORT_ID_KEYBOARD 2
 #define REPORT_ID_MOUSE 3
+#define REPORT_ID_VENDOR_OUTPUT 4
 #define CONSUMER_REPORT_SIZE 1
 #define KEYBOARD_REPORT_SIZE 8
 #define KEYBOARD_MAX_KEYS 6
 #define MOUSE_REPORT_SIZE 5
+#define VENDOR_OUTPUT_REPORT_SIZE 5
+#define VENDOR_OUTPUT_QUEUE_LENGTH 8
+#define GIMBAL_CONTROL_SERVICE_UUID_TEXT "f7c10001-b5a3-f393-e0a9-e50e24dcca9e"
+#define GIMBAL_CONTROL_CHAR_UUID_TEXT "f7c10002-b5a3-f393-e0a9-e50e24dcca9e"
 #define KEY_HOLD_MS 40
 #define KEY_RELEASE_MS 20
 #define TEXT_GAP_MS 50
@@ -63,6 +73,7 @@
 #define MOUSE_MIDDLE (1U << 2)
 #define MOUSE_MASK (MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE)
 #define HID_USAGE_PAGE(v) 0x05, (v)
+#define HID_USAGE_PAGE16(v) 0x06, ((v) & 0xff), (((v) >> 8) & 0xff)
 #define HID_USAGE(v) 0x09, (v)
 #define HID_USAGE16(v) 0x0a, ((v) & 0xff), (((v) >> 8) & 0xff)
 #define HID_USAGE_MIN(v) 0x19, (v)
@@ -72,9 +83,11 @@
 #define HID_REPORT_ID(v) 0x85, (v)
 #define HID_LOGICAL_MIN(v) 0x15, (v)
 #define HID_LOGICAL_MAX(v) 0x25, (v)
+#define HID_LOGICAL_MAX16(v) 0x26, ((v) & 0xff), (((v) >> 8) & 0xff)
 #define HID_REPORT_SIZE(v) 0x75, (v)
 #define HID_REPORT_COUNT(v) 0x95, (v)
 #define HID_INPUT(v) 0x81, (v)
+#define HID_OUTPUT(v) 0x91, (v)
 
 static const char *TAG = "lua_ble_hid";
 
@@ -111,6 +124,12 @@ typedef struct {
 } ascii_key_t;
 
 typedef struct {
+    uint16_t report_id;
+    uint8_t length;
+    uint8_t data[VENDOR_OUTPUT_REPORT_SIZE];
+} ble_hid_output_event_t;
+
+typedef struct {
     const char *name;
     lua_CFunction fn;
 } lua_hid_fn_t;
@@ -122,6 +141,7 @@ static bool s_controller_inited_by_ble_hid;
 static bool s_controller_enabled_by_ble_hid;
 static bool s_nimble_inited;
 static bool s_host_task_started;
+static bool s_gimbal_gatt_registered;
 static bool s_advertising_requested;
 static uint8_t s_own_addr_type;
 static char s_adv_name[LUA_HID_NAME_MAX + 1] = LUA_HID_DEFAULT_NAME;
@@ -138,6 +158,78 @@ static void *s_external_gatts_register_arg;
 static esp_hidd_dev_t *s_hid_dev;
 static hid_status_t s_status;
 static uint8_t s_mouse_buttons;
+static QueueHandle_t s_output_queue;
+static uint16_t s_gimbal_control_val_handle;
+
+static const ble_uuid128_t s_gimbal_control_service_uuid =
+    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                     0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0xc1, 0xf7);
+static const ble_uuid128_t s_gimbal_control_char_uuid =
+    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                     0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0xc1, 0xf7);
+
+static void queue_vendor_output_report(const uint8_t *data, size_t length)
+{
+    if (!s_output_queue || data == NULL || length != VENDOR_OUTPUT_REPORT_SIZE) {
+        return;
+    }
+
+    ble_hid_output_event_t event = {
+        .report_id = REPORT_ID_VENDOR_OUTPUT,
+        .length = VENDOR_OUTPUT_REPORT_SIZE,
+    };
+
+    memcpy(event.data, data, sizeof(event.data));
+    if (xQueueSend(s_output_queue, &event, 0) != pdTRUE) {
+        ble_hid_output_event_t discarded;
+        (void)xQueueReceive(s_output_queue, &discarded, 0);
+        (void)xQueueSend(s_output_queue, &event, 0);
+    }
+}
+
+static int gimbal_control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                    struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    uint8_t data[VENDOR_OUTPUT_REPORT_SIZE];
+    uint16_t length;
+
+    (void)conn_handle;
+    (void)arg;
+    if (ctxt == NULL || ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR ||
+            attr_handle != s_gimbal_control_val_handle) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    length = OS_MBUF_PKTLEN(ctxt->om);
+    if (length != VENDOR_OUTPUT_REPORT_SIZE) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+    if (os_mbuf_copydata(ctxt->om, 0, sizeof(data), data) != 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    queue_vendor_output_report(data, sizeof(data));
+    return 0;
+}
+
+static const struct ble_gatt_chr_def s_gimbal_control_chrs[] = {
+    {
+        .uuid = &s_gimbal_control_char_uuid.u,
+        .access_cb = gimbal_control_access_cb,
+        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+        .val_handle = &s_gimbal_control_val_handle,
+    },
+    { 0 },
+};
+
+static const struct ble_gatt_svc_def s_gimbal_control_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &s_gimbal_control_service_uuid.u,
+        .characteristics = s_gimbal_control_chrs,
+    },
+    { 0 },
+};
 
 static const uint8_t s_report_map[] = {
     HID_USAGE_PAGE(0x0c), HID_USAGE(0x01), HID_COLLECTION(0x01),
@@ -167,6 +259,12 @@ static const uint8_t s_report_map[] = {
     HID_REPORT_SIZE(0x08), HID_REPORT_COUNT(0x03), HID_INPUT(0x06),
     HID_USAGE_PAGE(0x0c), HID_USAGE16(0x0238), HID_REPORT_COUNT(0x01), HID_INPUT(0x06),
     HID_END_COLLECTION, HID_END_COLLECTION,
+
+    HID_USAGE_PAGE16(0xff00), HID_USAGE(0x01), HID_COLLECTION(0x01),
+    HID_REPORT_ID(REPORT_ID_VENDOR_OUTPUT),
+    HID_LOGICAL_MIN(0x00), HID_LOGICAL_MAX16(0xff),
+    HID_REPORT_SIZE(0x08), HID_REPORT_COUNT(VENDOR_OUTPUT_REPORT_SIZE), HID_OUTPUT(0x02),
+    HID_END_COLLECTION,
 };
 
 static esp_hid_raw_report_map_t s_report_maps[] = {
@@ -412,6 +510,30 @@ static void ble_hid_controller_stop(void)
     }
 }
 
+static esp_err_t ble_hid_register_gimbal_control_service(void)
+{
+    int rc;
+
+    if (s_gimbal_gatt_registered) {
+        return ESP_OK;
+    }
+
+    rc = ble_gatts_count_cfg(s_gimbal_control_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gatts_count_cfg gimbal control failed rc=%d", rc);
+        return ESP_FAIL;
+    }
+
+    rc = ble_gatts_add_svcs(s_gimbal_control_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gatts_add_svcs gimbal control failed rc=%d", rc);
+        return ESP_FAIL;
+    }
+
+    s_gimbal_gatt_registered = true;
+    return ESP_OK;
+}
+
 static esp_err_t ble_hid_stack_prepare(void)
 {
     esp_err_t err;
@@ -439,6 +561,14 @@ static esp_err_t ble_hid_stack_prepare(void)
         return err;
     }
     s_nimble_inited = true;
+
+    err = ble_hid_register_gimbal_control_service();
+    if (err != ESP_OK) {
+        (void)esp_nimble_deinit();
+        s_nimble_inited = false;
+        ble_hid_controller_stop();
+        return err;
+    }
     return ESP_OK;
 }
 
@@ -512,6 +642,8 @@ static esp_err_t ble_hid_stack_stop(void)
         err = esp_nimble_deinit();
         if (err == ESP_OK) {
             s_nimble_inited = false;
+            s_gimbal_gatt_registered = false;
+            s_gimbal_control_val_handle = 0;
         }
     }
 
@@ -756,6 +888,14 @@ static void hidd_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_mouse_buttons = 0;
         ESP_LOGI(TAG, "HID disconnected");
         break;
+    case ESP_HIDD_OUTPUT_EVENT:
+        if (param && s_output_queue &&
+                param->output.report_id == REPORT_ID_VENDOR_OUTPUT &&
+                param->output.length == VENDOR_OUTPUT_REPORT_SIZE &&
+                param->output.data) {
+            queue_vendor_output_report(param->output.data, param->output.length);
+        }
+        break;
     case ESP_HIDD_PROTOCOL_MODE_EVENT:
         ESP_LOGI(TAG, "HID protocol mode=%u", param ? param->protocol_mode.protocol_mode : 0);
         break;
@@ -880,20 +1020,34 @@ static esp_err_t init_hid_device(const char *name)
     if (s_hid_dev) {
         return ESP_OK;
     }
+    if (!s_output_queue) {
+        s_output_queue = xQueueCreate(VENDOR_OUTPUT_QUEUE_LENGTH, sizeof(ble_hid_output_event_t));
+        if (!s_output_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        xQueueReset(s_output_queue);
+    }
     err = ble_hid_stack_prepare();
     if (err != ESP_OK) {
+        vQueueDelete(s_output_queue);
+        s_output_queue = NULL;
         return err;
     }
     err = esp_hidd_dev_init(&config, ESP_HID_TRANSPORT_BLE, hidd_event_handler, &s_hid_dev);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_hidd_dev_init failed: %s", esp_err_to_name(err));
         s_hid_dev = NULL;
+        vQueueDelete(s_output_queue);
+        s_output_queue = NULL;
         return err;
     }
     err = ble_hid_stack_start();
     if (err != ESP_OK) {
         (void)esp_hidd_dev_deinit(s_hid_dev);
         s_hid_dev = NULL;
+        vQueueDelete(s_output_queue);
+        s_output_queue = NULL;
         return err;
     }
     s_status.initialized = true;
@@ -927,6 +1081,10 @@ static int lua_ble_hid_deinit(lua_State *L)
     if (s_hid_dev) {
         err = esp_hidd_dev_deinit(s_hid_dev);
         s_hid_dev = NULL;
+    }
+    if (s_output_queue) {
+        vQueueDelete(s_output_queue);
+        s_output_queue = NULL;
     }
     s_status.initialized = false;
     s_status.advertising = false;
@@ -1124,6 +1282,36 @@ static int lua_ble_hid_release_all(lua_State *L)
     return push_result(L, release_all(true));
 }
 
+static int lua_ble_hid_receive(lua_State *L)
+{
+    lua_Integer timeout_ms = luaL_optinteger(L, 1, 0);
+    ble_hid_output_event_t event;
+    TickType_t wait_ticks;
+
+    if (timeout_ms < 0) {
+        return luaL_error(L, "timeout_ms must be >= 0");
+    }
+    if (!s_status.initialized || !s_output_queue) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "HID not initialized");
+        return 2;
+    }
+
+    wait_ticks = timeout_ms == 0 ? 0 : pdMS_TO_TICKS((uint32_t)timeout_ms);
+    if (xQueueReceive(s_output_queue, &event, wait_ticks) != pdTRUE) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "timeout");
+        return 2;
+    }
+
+    lua_newtable(L);
+    lua_pushinteger(L, event.report_id);
+    lua_setfield(L, -2, "report_id");
+    lua_pushlstring(L, (const char *)event.data, event.length);
+    lua_setfield(L, -2, "data");
+    return 1;
+}
+
 static int lua_ble_hid_status(lua_State *L)
 {
     s_status.connected = s_hid_dev ? esp_hidd_dev_connected(s_hid_dev) : false;
@@ -1149,6 +1337,14 @@ static int lua_ble_hid_describe(lua_State *L)
     lua_setfield(L, -2, "keyboard_report_id");
     lua_pushinteger(L, REPORT_ID_MOUSE);
     lua_setfield(L, -2, "mouse_report_id");
+    lua_pushinteger(L, REPORT_ID_VENDOR_OUTPUT);
+    lua_setfield(L, -2, "vendor_output_report_id");
+    lua_pushinteger(L, VENDOR_OUTPUT_REPORT_SIZE);
+    lua_setfield(L, -2, "vendor_output_report_size");
+    lua_pushstring(L, GIMBAL_CONTROL_SERVICE_UUID_TEXT);
+    lua_setfield(L, -2, "gimbal_control_service_uuid");
+    lua_pushstring(L, GIMBAL_CONTROL_CHAR_UUID_TEXT);
+    lua_setfield(L, -2, "gimbal_control_char_uuid");
     lua_pushstring(L, "basic ASCII simulation on standard US keyboard layout");
     lua_setfield(L, -2, "text_scope");
     lua_pushboolean(L, false);
@@ -1172,7 +1368,7 @@ int luaopen_ble_hid(lua_State *L)
         { "key", lua_ble_hid_key }, { "combo", lua_ble_hid_combo }, { "text", lua_ble_hid_text },
         { "mouse_move", lua_ble_hid_mouse_move }, { "mouse_scroll", lua_ble_hid_mouse_scroll },
         { "mouse_button", lua_ble_hid_mouse_button }, { "release_all", lua_ble_hid_release_all },
-        { "describe", lua_ble_hid_describe },
+        { "receive", lua_ble_hid_receive }, { "describe", lua_ble_hid_describe },
     };
 
     lua_newtable(L);
