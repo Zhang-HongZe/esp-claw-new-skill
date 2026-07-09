@@ -19,6 +19,29 @@
 #define LUA_MODULE_CAMERA_NAME "camera"
 
 static const char *TAG = "lua_camera";
+static char s_lua_camera_owner_key;
+
+static bool lua_module_camera_state_owns(lua_State *L)
+{
+    bool owns = false;
+
+    lua_pushlightuserdata(L, &s_lua_camera_owner_key);
+    lua_gettable(L, LUA_REGISTRYINDEX);
+    owns = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    return owns;
+}
+
+static void lua_module_camera_set_state_owns(lua_State *L, bool owns)
+{
+    lua_pushlightuserdata(L, &s_lua_camera_owner_key);
+    if (owns) {
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushnil(L);
+    }
+    lua_settable(L, LUA_REGISTRYINDEX);
+}
 
 /* Camera-side release hook. The service can hold multiple borrowed buffers,
  * each identified by its data pointer; ctx is unused. */
@@ -191,6 +214,8 @@ static int lua_module_camera_open(lua_State *L)
     int n_preferred = 0;
     bool has_format = false;
     bool has_opts_table = false;
+    bool already_open = false;
+    bool owned_by_this_state = false;
     esp_err_t err;
 
     if (!lua_isnoneornil(L, 2)) {
@@ -238,6 +263,11 @@ static int lua_module_camera_open(lua_State *L)
     /* Fast path: nothing to enumerate. Pass through to the HAL — either no
      * opts at all (idempotent open) or exact (w, h) with no nearest snap. */
     bool needs_probe = has_format || (opt_nearest && opts.width != 0 && opts.height != 0);
+    already_open = camera_is_open();
+    owned_by_this_state = lua_module_camera_state_owns(L);
+    if (already_open && !owned_by_this_state) {
+        return luaL_error(L, "camera open failed: camera is already owned by another Lua job");
+    }
     if (!needs_probe) {
         err = camera_open(dev_path, has_opts_table ? &opts : NULL);
         if (err == ESP_ERR_INVALID_STATE) {
@@ -246,6 +276,7 @@ static int lua_module_camera_open(lua_State *L)
         if (err != ESP_OK) {
             return luaL_error(L, "camera open failed: %s", esp_err_to_name(err));
         }
+        lua_module_camera_set_state_owns(L, true);
         lua_pushboolean(L, 1);
         return 1;
     }
@@ -259,11 +290,13 @@ static int lua_module_camera_open(lua_State *L)
         if (err != ESP_OK) {
             return luaL_error(L, "camera open: close-before-probe failed: %s", esp_err_to_name(err));
         }
+        lua_module_camera_set_state_owns(L, false);
     }
     err = camera_open(dev_path, NULL);
     if (err != ESP_OK) {
         return luaL_error(L, "camera open: probe failed: %s", esp_err_to_name(err));
     }
+    lua_module_camera_set_state_owns(L, true);
 
     /* Resolve fourcc. */
     uint32_t chosen_fourcc = 0;
@@ -273,10 +306,12 @@ static int lua_module_camera_open(lua_State *L)
             char avail[64];
             lua_module_camera_describe_available(avail, sizeof(avail));
             (void)camera_close();
+            lua_module_camera_set_state_owns(L, false);
             return luaL_error(L, "camera open: none of requested formats supported; sensor offers {%s}", avail);
         }
         if (err != ESP_OK) {
             (void)camera_close();
+            lua_module_camera_set_state_owns(L, false);
             return luaL_error(L, "camera open: format enumerate failed: %s", esp_err_to_name(err));
         }
     } else {
@@ -284,6 +319,7 @@ static int lua_module_camera_open(lua_State *L)
         err = camera_get_stream_info(&info);
         if (err != ESP_OK) {
             (void)camera_close();
+            lua_module_camera_set_state_owns(L, false);
             return luaL_error(L, "camera open: read probe stream info failed: %s", esp_err_to_name(err));
         }
         chosen_fourcc = info.pixel_format;
@@ -337,10 +373,12 @@ static int lua_module_camera_open(lua_State *L)
     if (err != ESP_OK) {
         return luaL_error(L, "camera open: close-before-reopen failed: %s", esp_err_to_name(err));
     }
+    lua_module_camera_set_state_owns(L, false);
     err = camera_open(dev_path, &reopen);
     if (err != ESP_OK) {
         return luaL_error(L, "camera open: reopen failed: %s", esp_err_to_name(err));
     }
+    lua_module_camera_set_state_owns(L, true);
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -553,6 +591,10 @@ static int lua_module_camera_get_frame(lua_State *L)
  * Closes the camera device and releases all resources. */
 static int lua_module_camera_close(lua_State *L)
 {
+    if (!lua_module_camera_state_owns(L)) {
+        return luaL_error(L, "camera close failed: current Lua job did not open the camera");
+    }
+
     esp_err_t err = camera_close();
 
     if (err != ESP_OK) {
@@ -564,6 +606,7 @@ static int lua_module_camera_close(lua_State *L)
         return luaL_error(L, "camera close failed: %s", esp_err_to_name(err));
     }
 
+    lua_module_camera_set_state_owns(L, false);
     lua_pushboolean(L, 1);
     return 1;
 }

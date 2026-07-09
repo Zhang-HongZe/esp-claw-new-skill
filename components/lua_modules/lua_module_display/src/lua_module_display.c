@@ -27,6 +27,29 @@
 #include <string.h>
 
 static const char *TAG = "lua_display";
+static char s_lua_display_owner_key;
+
+static bool lua_display_state_owns(lua_State *L)
+{
+    bool owns = false;
+
+    lua_pushlightuserdata(L, &s_lua_display_owner_key);
+    lua_gettable(L, LUA_REGISTRYINDEX);
+    owns = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    return owns;
+}
+
+static void lua_display_set_state_owns(lua_State *L, bool owns)
+{
+    lua_pushlightuserdata(L, &s_lua_display_owner_key);
+    if (owns) {
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushnil(L);
+    }
+    lua_settable(L, LUA_REGISTRYINDEX);
+}
 
 /* -------------------------------------------------------------------------
  * Argument helpers (mirrors the reference implementation)
@@ -154,15 +177,18 @@ static void lua_display_reject_table_field(lua_State *L, int index, const char *
 
 static void lua_display_exit_cleanup(lua_State *L)
 {
-    (void)L;
-
+    if (!lua_display_state_owns(L)) {
+        return;
+    }
     if (!display_arbiter_is_owner(DISPLAY_ARBITER_OWNER_LUA)) {
+        lua_display_set_state_owns(L, false);
         return;
     }
     ESP_LOGI(TAG, "Lua exit cleanup: display still owned by Lua, releasing");
 
     if (display_hal_destroy() == ESP_OK) {
         display_arbiter_release(DISPLAY_ARBITER_OWNER_LUA);
+        lua_display_set_state_owns(L, false);
     }
 }
 
@@ -188,13 +214,17 @@ static int lua_display_init(lua_State *L)
         return luaL_error(L, "display init failed: %s", esp_err_to_name(err));
     }
 
+    lua_display_set_state_owns(L, true);
     lua_pushboolean(L, 1);
     return 1;
 }
 
 static int lua_display_deinit(lua_State *L)
 {
-    (void)L;
+    if (!lua_display_state_owns(L)) {
+        return luaL_error(L, "display deinit failed: current Lua job did not init display");
+    }
+
     esp_err_t err = display_hal_destroy();
     if (err != ESP_OK) {
         return luaL_error(L, "display deinit failed: %s", esp_err_to_name(err));
@@ -205,6 +235,7 @@ static int lua_display_deinit(lua_State *L)
         return luaL_error(L, "display release failed: %s", esp_err_to_name(err));
     }
 
+    lua_display_set_state_owns(L, false);
     lua_pushboolean(L, 1);
     return 1;
 }
