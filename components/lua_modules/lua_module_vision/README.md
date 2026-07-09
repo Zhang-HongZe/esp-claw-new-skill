@@ -4,8 +4,8 @@ Lua vision modules backed by `image.frame` buffers.
 
 ## Modules
 
-- `motion_detect`: compares two `image.frame` objects and returns the number of changed sample points. Enabled by default with `LUA_MODULE_VISION_MOTION_DETECT`.
-- `color_detect`: detects a green blob in an `image.frame` and returns a bounding box. Enabled by default with `LUA_MODULE_VISION_COLOR_DETECT`.
+- `vision_motion_detect`: compares two `image.frame` objects and returns the number of changed sample points. Enabled by default with `LUA_MODULE_VISION_MOTION_DETECT`.
+- `color_detect`: detects a color blob in an `image.frame` and returns a bounding box. Enabled by default with `LUA_MODULE_VISION_COLOR_DETECT`.
 - `espdet`: runs ESP-DL ESPDet object detection from Lua with a user-provided `.espdl` model file. Enable with `LUA_MODULE_VISION_ESPDET`.
 
 All functions read the frame only during the call. Release frames with `frame:release()` after the vision call returns.
@@ -17,7 +17,7 @@ Frame conversion is handled by the shared `image` module, so Lua scripts pass th
 local camera = require("camera")
 local display = require("display")
 local image = require("image")
-local motion = require("motion_detect")
+local motion = require("vision_motion_detect")
 
 camera.open("/dev/video0")
 
@@ -74,13 +74,14 @@ espdet.unload()
 - `pixel_threshold` is a per-sample gray-value ratio threshold in `[0, 1]`; `0.04` is about a 10-level gray difference.
 - `moving_threshold` is a moving sample ratio threshold in `[0, 1]`; `0.03` means more than 3% of sampled points must change.
 - Detection results include `moving_points`, `sample_points`, and `moving_ratio = moving_points / sample_points`.
-- `motion.detect(frame, opts)` compares `frame` with an internal copy of the previous frame and then updates that copy.
-- `motion.detect(frame1, frame2, opts)` compares two explicit frames.
-- `motion.reset()` clears the internal previous-frame copy.
+- Import lightweight vision motion detection with `local motion = require("vision_motion_detect")`.
+- `vision_motion_detect.detect(frame, opts)` compares `frame` with an internal copy of the previous frame and then updates that copy.
+- `vision_motion_detect.detect(frame1, frame2, opts)` compares two explicit frames.
+- `vision_motion_detect.reset()` clears the internal previous-frame copy.
 - Import color detection with `local color_detect = require("color_detect")`.
 - `color_detect.detect(frame, opts)` accepts an `image.frame` and internally requests RGB565LE through the shared `image` module.
 - Color detection defaults to green and returns `{ detected, count, left, top, right, bottom, x, y, box_width, box_height, cx, cy, pixels, width, height, stride }`.
-- `opts` supports `stride`, `min_pixels`, `h_min`, `h_max`, `s_min`, and `v_min`. Hue values are in `[0, 180]`; the default range is tuned for green.
+- `opts` supports `stride`, `min_pixels`, `h_min`, `h_max`, `s_min`, and `v_min`. Hue values are in `[0, 180]`; saturation/value thresholds are normalized to `[0, 1]`; the default range is tuned for green.
 - Import ESPDet with `local espdet = require("espdet")`.
 - `espdet.detect(frame, opts)` accepts an `image.frame` and internally requests RGB565LE through the shared `image` module.
 - Load a model once with `espdet.load(path[, opts])`, or pass `opts.model_path` on each `detect()` call.

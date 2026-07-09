@@ -531,7 +531,7 @@ esp_err_t lua_module_vision_register(void)
 #else
     static const cap_lua_module_t modules[] = {
 #if CONFIG_LUA_MODULE_VISION_MOTION_DETECT
-        {"motion_detect", luaopen_motion_detect},
+        {"vision_motion_detect", luaopen_motion_detect},
 #endif
 #if CONFIG_LUA_MODULE_VISION_COLOR_DETECT
         {"color_detect", luaopen_color_detect},
