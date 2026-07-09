@@ -129,7 +129,10 @@ local function init_display()
     display.init(panel_handle, io_handle, lcd_width, lcd_height, panel_if)
     display_started = true
     pcall(display.backlight, true)
+    display.begin_frame({ clear = true, color = "black" })
     display.fill_rect(0, 0, display.width, display.height, "black")
+    display.present()
+    display.end_frame()
 end
 
 local function init_camera()
@@ -237,6 +240,7 @@ local function run()
         local display_ms = 0
         if (frame_index % ctx.display_every_n) == 0 then
             t0 = system.millis()
+            display.begin_frame({ clear = false })
             local output_w, output_h = display.draw_image(dst_x, dst_y, rgb565, {
                 mode = "crop",
                 source = {
@@ -252,6 +256,8 @@ local function run()
             draw_motion_box(motion_result, dst_x, dst_y, output_w or src_w, output_h or src_h,
                             src_x, src_y, src_w, src_h)
             draw_center_cross()
+            display.present()
+            display.end_frame()
             display_ms = system.millis() - t0
         end
 

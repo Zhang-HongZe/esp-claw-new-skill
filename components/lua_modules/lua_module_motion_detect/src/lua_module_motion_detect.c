@@ -746,7 +746,7 @@ static void motion_register_metatable(lua_State *L)
     lua_pop(L, 1);
 }
 
-int luaopen_motion_detect(lua_State *L)
+int luaopen_lua_module_motion_detect(lua_State *L)
 {
     static const luaL_Reg funcs[] = {
         {"new", motion_detector_new},
@@ -763,5 +763,5 @@ int luaopen_motion_detect(lua_State *L)
 
 esp_err_t lua_module_motion_detect_register(void)
 {
-    return cap_lua_register_module(LUA_MODULE_MOTION_DETECT_NAME, luaopen_motion_detect);
+    return cap_lua_register_module(LUA_MODULE_MOTION_DETECT_NAME, luaopen_lua_module_motion_detect);
 }

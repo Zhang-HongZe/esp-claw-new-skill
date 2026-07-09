@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-int luaopen_motion_detect(lua_State *L);
+int luaopen_lua_module_motion_detect(lua_State *L);
 esp_err_t lua_module_motion_detect_register(void);
 
 #ifdef __cplusplus
