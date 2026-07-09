@@ -15,11 +15,14 @@ local DEFAULT_DISPLAY_CROP_SIZE = 240
 local DEFAULT_DISPLAY_FLIP_Y = true
 local DEFAULT_PERF_LOG_EVERY_N = 10
 local DEFAULT_DETECT_STRIDE = 4
-local DEFAULT_DETECT_MIN_PIXELS = 20
+local DEFAULT_DETECT_MIN_PIXELS = 250
+local DEFAULT_DETECT_MAX_BLOB_PERCENT = 35
 local DEFAULT_GREEN_H_MIN = 50
 local DEFAULT_GREEN_H_MAX = 88
 local DEFAULT_GREEN_S_MIN = 0.31
+local DEFAULT_GREEN_S_MAX = 1.0
 local DEFAULT_GREEN_V_MIN = 0.20
+local DEFAULT_GREEN_V_MAX = 1.0
 local DEFAULT_DEADZONE_PX = 12
 local DEFAULT_X_GAIN = 0.035
 local DEFAULT_Y_GAIN = -0.035
@@ -55,10 +58,13 @@ local ARG_SCHEMA = {
     perf_log_every_n = arg_schema.int({ default = DEFAULT_PERF_LOG_EVERY_N, min = 0 }),
     detect_stride = arg_schema.int({ default = DEFAULT_DETECT_STRIDE, min = 1 }),
     detect_min_pixels = arg_schema.int({ default = DEFAULT_DETECT_MIN_PIXELS, min = 1 }),
+    detect_max_blob_percent = arg_schema.int({ default = DEFAULT_DETECT_MAX_BLOB_PERCENT, min = 1, max = 100 }),
     green_h_min = arg_schema.int({ default = DEFAULT_GREEN_H_MIN, min = 0, max = 180 }),
     green_h_max = arg_schema.int({ default = DEFAULT_GREEN_H_MAX, min = 0, max = 180 }),
     green_s_min = arg_schema.int({ default = DEFAULT_GREEN_S_MIN, min = 0, max = 1, floor = false }),
+    green_s_max = arg_schema.int({ default = DEFAULT_GREEN_S_MAX, min = 0, max = 1, floor = false }),
     green_v_min = arg_schema.int({ default = DEFAULT_GREEN_V_MIN, min = 0, max = 1, floor = false }),
+    green_v_max = arg_schema.int({ default = DEFAULT_GREEN_V_MAX, min = 0, max = 1, floor = false }),
     deadzone_px = arg_schema.int({ default = DEFAULT_DEADZONE_PX, min = 0 }),
     x_gain = arg_schema.int({ default = DEFAULT_X_GAIN, floor = false }),
     y_gain = arg_schema.int({ default = DEFAULT_Y_GAIN, floor = false }),
@@ -121,6 +127,12 @@ local function validate_config()
     end
     if ctx.y_min_angle > ctx.y_max_angle then
         error("y_min_angle must be <= y_max_angle")
+    end
+    if ctx.green_s_min > ctx.green_s_max then
+        error("green_s_min must be <= green_s_max")
+    end
+    if ctx.green_v_min > ctx.green_v_max then
+        error("green_v_min must be <= green_v_max")
     end
 end
 
@@ -344,14 +356,28 @@ local function run()
         end
         local rgb565 <close> = rgb565_or_err
 
+        local image_w = frame_info.width or stream.width
+        local image_h = frame_info.height or stream.height
+        local src_x, src_y, src_w, src_h = compute_center_square_source_rect(image_w, image_h)
+        local max_blob_pixels = math.floor(src_w * src_h * ctx.detect_max_blob_percent / 100)
+
         t0 = system.millis()
         local detected, detect_result_or_err = pcall(color_detect.detect, rgb565, {
             stride = ctx.detect_stride,
             min_pixels = ctx.detect_min_pixels,
+            max_blob_pixels = max_blob_pixels,
+            source = {
+                x = src_x,
+                y = src_y,
+                width = src_w,
+                height = src_h,
+            },
             h_min = ctx.green_h_min,
             h_max = ctx.green_h_max,
             s_min = ctx.green_s_min,
+            s_max = ctx.green_s_max,
             v_min = ctx.green_v_min,
+            v_max = ctx.green_v_max,
         })
         local detect_ms = system.millis() - t0
         if not detected then
@@ -375,9 +401,6 @@ local function run()
         local display_ms = 0
         if (frame_index % ctx.display_every_n) == 0 then
             t0 = system.millis()
-            local image_w = detect_result.width or stream.width
-            local image_h = detect_result.height or stream.height
-            local src_x, src_y, src_w, src_h = compute_center_square_source_rect(image_w, image_h)
             local dst_x = math.floor((display.width - src_w) / 2)
             local output_w, output_h = display.draw_image(dst_x, 0, rgb565, {
                 mode = "crop",

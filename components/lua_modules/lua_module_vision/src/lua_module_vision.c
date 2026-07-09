@@ -534,7 +534,7 @@ esp_err_t lua_module_vision_register(void)
         {"vision_motion_detect", luaopen_motion_detect},
 #endif
 #if CONFIG_LUA_MODULE_VISION_COLOR_DETECT
-        {"color_detect", luaopen_color_detect},
+        {"color_detect", luaopen_color_detect_dl},
 #endif
 #if CONFIG_LUA_MODULE_VISION_ESPDET
         {"espdet", luaopen_espdet},

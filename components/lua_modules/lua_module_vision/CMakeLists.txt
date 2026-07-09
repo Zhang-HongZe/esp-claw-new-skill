@@ -18,6 +18,15 @@ if(CONFIG_APP_CLAW_LUA_MODULE_VISION AND CONFIG_ESP_BOARD_DEV_CAMERA_SUPPORT)
         )
     endif()
 
+    if(CONFIG_LUA_MODULE_VISION_COLOR_DETECT)
+        list(APPEND lua_module_vision_srcs
+            "src/color_detect.cpp"
+        )
+        list(APPEND lua_module_vision_requires
+            esp-dl
+        )
+    endif()
+
     if(CONFIG_LUA_MODULE_VISION_ESPDET)
         list(APPEND lua_module_vision_srcs
             "src/espdet.cpp"

@@ -34,6 +34,7 @@ int luaopen_motion_detect(lua_State *L);
  * @return Number of Lua return values
  */
 int luaopen_color_detect(lua_State *L);
+int luaopen_color_detect_dl(lua_State *L);
 #endif
 
 /**

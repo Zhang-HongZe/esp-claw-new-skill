@@ -1,7 +1,7 @@
 ---
 {
   "name": "gimbal_color_detect",
-  "description": "Use the camera and vision Lua modules to detect a green target, show the camera preview on the LCD, draw a bounding box, and drive X/Y gimbal servos toward the target center.",
+  "description": "Use the camera and ESP-DL-backed color_detect Lua module to detect a green target, show the camera preview on the LCD, draw a bounding box, and drive X/Y gimbal servos toward the target center.",
   "metadata": {
     "cap_groups": [
       "cap_lua"
@@ -27,16 +27,20 @@
 
 Use this skill when the user wants `esp-claw` to use the camera as a visual
 servo target tracker. The script opens the board camera, displays frames on the
-LCD, detects a green object through the `color_detect` vision Lua module, draws
-the detection box, and directly drives X/Y servos from the same Lua job.
+LCD, detects a green object through the ESP-DL-backed `color_detect` vision Lua
+module, draws the detection box, and directly drives X/Y servos from the same
+Lua job.
 
 The default detection target is green. Tune the HSV-like thresholds through
-`green_h_min`, `green_h_max`, `green_s_min`, and `green_v_min` if the lighting
-or target color changes.
+`green_h_min`, `green_h_max`, `green_s_min`, `green_s_max`, `green_v_min`, and
+`green_v_max` if the lighting or target color changes. Hue uses `0..180`;
+saturation/value use normalized `0..1` values and are converted to ESP-DL's
+`0..255` HSV mask thresholds internally.
 
 Preview display follows the `esp-hello-new/examples/gimbal_base` camera path by
 default: crop a centered `240x240` square from the board-default camera stream,
-flip it vertically, and draw it centered on the `284x240` LCD.
+flip it vertically, and draw it centered on the `284x240` LCD. Detection runs on
+that same centered crop so off-screen colors do not affect the tracked box.
 
 ## Default Hardware
 
@@ -87,11 +91,18 @@ flip it vertically, and draw it centered on the `284x240` LCD.
     },
     "detect_stride": {
       "type": "integer",
-      "default": 4
+      "default": 4,
+      "description": "Kept for compatibility. ESP-DL color detection evaluates the HSV mask for the selected source crop."
     },
     "detect_min_pixels": {
       "type": "integer",
-      "default": 20
+      "default": 250,
+      "description": "Minimum connected-component size, matching the ESP-DL gimbal_base detector scale."
+    },
+    "detect_max_blob_percent": {
+      "type": "integer",
+      "default": 35,
+      "description": "Reject connected components larger than this percentage of the display crop."
     },
     "green_h_min": {
       "type": "integer",
@@ -105,9 +116,17 @@ flip it vertically, and draw it centered on the `284x240` LCD.
       "type": "number",
       "default": 0.31
     },
+    "green_s_max": {
+      "type": "number",
+      "default": 1.0
+    },
     "green_v_min": {
       "type": "number",
       "default": 0.2
+    },
+    "green_v_max": {
+      "type": "number",
+      "default": 1.0
     },
     "deadzone_px": {
       "type": "integer",
