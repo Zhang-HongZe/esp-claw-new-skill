@@ -29,6 +29,7 @@
 static const char *TAG = "display_hal";
 
 #define DISPLAY_HAL_FRAMEBUFFER_COUNT_MAX 2
+#define DISPLAY_HAL_SUBMIT_BUFFER_COUNT_MAX 2
 #define DISPLAY_HAL_FLUSH_TIMEOUT_MS      2000
 #define DISPLAY_HAL_PI                    3.14159265358979323846f
 
@@ -56,7 +57,10 @@ typedef struct {
     bool framebuffer_initialized;
     display_dirty_rect_t dirty;
     SemaphoreHandle_t display_flush_done;
-    uint16_t *submit_swap_buffer;
+    uint16_t *submit_swap_buffers[DISPLAY_HAL_SUBMIT_BUFFER_COUNT_MAX];
+    uint8_t submit_swap_buffer_count;
+    uint8_t next_submit_swap_buffer_index;
+    int8_t in_flight_submit_swap_buffer_index;
     size_t submit_swap_buffer_pixels;
 } display_hal_state_t;
 
@@ -117,6 +121,77 @@ static void display_hal_bswap16_into(uint16_t *dst, const uint16_t *src, size_t 
     for (size_t i = 0; i < pixel_count; ++i) {
         dst[i] = __builtin_bswap16(src[i]);
     }
+}
+
+static void display_hal_free_submit_swap_buffers_locked(void)
+{
+    for (size_t i = 0; i < DISPLAY_HAL_SUBMIT_BUFFER_COUNT_MAX; ++i) {
+        heap_caps_free(s_state.submit_swap_buffers[i]);
+        s_state.submit_swap_buffers[i] = NULL;
+    }
+    s_state.submit_swap_buffer_count = 0;
+    s_state.next_submit_swap_buffer_index = 0;
+    s_state.in_flight_submit_swap_buffer_index = -1;
+    s_state.submit_swap_buffer_pixels = 0;
+}
+
+static esp_err_t display_hal_alloc_submit_swap_buffers_locked(size_t bytes, size_t pixels)
+{
+    display_hal_free_submit_swap_buffers_locked();
+
+    s_state.submit_swap_buffers[0] = heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_RETURN_ON_FALSE(s_state.submit_swap_buffers[0] != NULL, ESP_ERR_NO_MEM, TAG,
+                        "alloc submit swap buffer failed");
+    s_state.submit_swap_buffer_count = 1;
+    s_state.submit_swap_buffer_pixels = pixels;
+
+    s_state.submit_swap_buffers[1] = heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_state.submit_swap_buffers[1]) {
+        s_state.submit_swap_buffer_count = 2;
+    } else {
+        ESP_LOGW(TAG, "alloc second submit swap buffer failed, async preview will use single buffer");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t display_hal_get_submit_swap_buffer_locked(size_t pixel_count,
+                                                           bool allow_inflight_overlap,
+                                                           uint16_t **out_buffer,
+                                                           int8_t *out_index)
+{
+    uint8_t index = 0;
+
+    ESP_RETURN_ON_FALSE(out_buffer != NULL && out_index != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "submit buffer output missing");
+    *out_buffer = NULL;
+    *out_index = -1;
+    ESP_RETURN_ON_FALSE(s_state.submit_swap_buffer_count > 0, ESP_ERR_INVALID_STATE, TAG,
+                        "submit swap buffer missing");
+    ESP_RETURN_ON_FALSE(pixel_count <= s_state.submit_swap_buffer_pixels, ESP_ERR_INVALID_SIZE, TAG,
+                        "submit swap buffer too small");
+
+    if (!allow_inflight_overlap || s_state.submit_swap_buffer_count == 1) {
+        ESP_RETURN_ON_ERROR(
+            display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS)),
+            TAG, "wait flush failed");
+    }
+
+    index = s_state.next_submit_swap_buffer_index % s_state.submit_swap_buffer_count;
+    if (s_state.flush_in_flight &&
+        (int8_t)index == s_state.in_flight_submit_swap_buffer_index &&
+        s_state.submit_swap_buffer_count > 1) {
+        index = (uint8_t)((index + 1) % s_state.submit_swap_buffer_count);
+    }
+    if (s_state.flush_in_flight &&
+        (int8_t)index == s_state.in_flight_submit_swap_buffer_index) {
+        ESP_RETURN_ON_ERROR(
+            display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS)),
+            TAG, "wait submit buffer failed");
+    }
+
+    *out_buffer = s_state.submit_swap_buffers[index];
+    *out_index = (int8_t)index;
+    return ESP_OK;
 }
 
 static esp_err_t display_hal_lock(void)
@@ -185,18 +260,16 @@ esp_err_t display_hal_create(esp_lcd_panel_handle_t panel_handle,
             s_state.height == lcd_height &&
             s_state.display_flush_done != NULL &&
             s_state.display_callbacks_registered &&
-            (!display_hal_panel_requires_swap() || s_state.submit_swap_buffer != NULL)) {
+            (!display_hal_panel_requires_swap() || s_state.submit_swap_buffer_count > 0)) {
         ESP_LOGD(TAG, "display_hal_create: already initialized with matching params, no-op");
         ret = ESP_OK;
         goto fail;
     }
 
-    if (s_state.submit_swap_buffer) {
+    if (s_state.submit_swap_buffer_count > 0) {
         ESP_LOGW(TAG, "display_hal_create: freeing leftover swap buffer (%u px)",
                  (unsigned)s_state.submit_swap_buffer_pixels);
-        heap_caps_free(s_state.submit_swap_buffer);
-        s_state.submit_swap_buffer = NULL;
-        s_state.submit_swap_buffer_pixels = 0;
+        display_hal_free_submit_swap_buffers_locked();
     }
     if (s_state.display_callbacks_registered) {
         ESP_LOGW(TAG, "display_hal_create: clearing leftover display callbacks");
@@ -214,15 +287,16 @@ esp_err_t display_hal_create(esp_lcd_panel_handle_t panel_handle,
     s_state.draw_framebuffer_index = 0;
     s_state.visible_framebuffer_index = 0;
     s_state.pending_framebuffer_index = -1;
+    s_state.in_flight_submit_swap_buffer_index = -1;
     s_state.frame_active = false;
     s_state.flush_in_flight = false;
     s_state.framebuffer_initialized = false;
     display_dirty_clear(&s_state.dirty);
     if (display_hal_panel_requires_swap()) {
         size_t swap_bytes = s_state.framebuffer_bytes;
-        s_state.submit_swap_buffer = heap_caps_aligned_alloc(16, swap_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        ESP_GOTO_ON_FALSE(s_state.submit_swap_buffer != NULL, ESP_ERR_NO_MEM, fail, TAG, "alloc submit swap buffer failed");
-        s_state.submit_swap_buffer_pixels = (size_t)lcd_width * (size_t)lcd_height;
+        ESP_GOTO_ON_ERROR(display_hal_alloc_submit_swap_buffers_locked(
+                              swap_bytes, (size_t)lcd_width * (size_t)lcd_height),
+                          fail, TAG, "alloc submit swap buffers failed");
     }
     display_hal_clear_clip_locked();
 
@@ -238,9 +312,7 @@ esp_err_t display_hal_create(esp_lcd_panel_handle_t panel_handle,
 
 fail:
     if (ret != ESP_OK) {
-        heap_caps_free(s_state.submit_swap_buffer);
-        s_state.submit_swap_buffer = NULL;
-        s_state.submit_swap_buffer_pixels = 0;
+        display_hal_free_submit_swap_buffers_locked();
     }
     display_hal_unlock();
     return ret;
@@ -288,6 +360,7 @@ esp_err_t display_hal_destroy(void)
     s_state.draw_framebuffer_index = 0;
     s_state.visible_framebuffer_index = 0;
     s_state.pending_framebuffer_index = -1;
+    s_state.in_flight_submit_swap_buffer_index = -1;
     s_state.frame_active = false;
     s_state.flush_in_flight = false;
     s_state.framebuffer_initialized = false;
@@ -297,9 +370,7 @@ esp_err_t display_hal_destroy(void)
     s_state.clip_y = 0;
     s_state.clip_width = 0;
     s_state.clip_height = 0;
-    heap_caps_free(s_state.submit_swap_buffer);
-    s_state.submit_swap_buffer = NULL;
-    s_state.submit_swap_buffer_pixels = 0;
+    display_hal_free_submit_swap_buffers_locked();
     s_state.display_flush_done = NULL;
 
     /* Keep the HAL mutex alive across destroy/create cycles so concurrent callers cannot block on or acquire a deleted semaphore. */
@@ -740,6 +811,7 @@ static esp_err_t display_hal_wait_flush_done_locked(TickType_t timeout_ticks)
     }
 
     s_state.flush_in_flight = false;
+    s_state.in_flight_submit_swap_buffer_index = -1;
     if (s_state.pending_framebuffer_index >= 0) {
         s_state.visible_framebuffer_index = (uint8_t)s_state.pending_framebuffer_index;
         s_state.pending_framebuffer_index = -1;
@@ -747,16 +819,14 @@ static esp_err_t display_hal_wait_flush_done_locked(TickType_t timeout_ticks)
     return ESP_OK;
 }
 
-static esp_err_t display_hal_submit_bitmap_locked_ex(int x_start, int y_start,
-                                                     int x_end, int y_end,
-                                                     const uint16_t *pixels,
-                                                     int pending_framebuffer_index,
-                                                     bool wait_for_done,
-                                                     bool pixels_panel_order)
+static esp_err_t display_hal_submit_ready_bitmap_locked(int x_start, int y_start,
+                                                        int x_end, int y_end,
+                                                        const uint16_t *pixels,
+                                                        int pending_framebuffer_index,
+                                                        bool wait_for_done,
+                                                        int8_t submit_swap_buffer_index)
 {
     const uint16_t *submit_pixels = pixels;
-    size_t pixel_count = 0;
-    uint16_t *swap_buffer = NULL;
     esp_err_t ret = display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS));
     if (ret != ESP_OK) {
         return ret;
@@ -769,20 +839,12 @@ static esp_err_t display_hal_submit_bitmap_locked_ex(int x_start, int y_start,
 
     if (!display_arbiter_is_owner(DISPLAY_ARBITER_OWNER_LUA)) {
         s_state.flush_in_flight = false;
+        s_state.in_flight_submit_swap_buffer_index = -1;
         if (pending_framebuffer_index >= 0) {
             s_state.visible_framebuffer_index = (uint8_t)pending_framebuffer_index;
             s_state.pending_framebuffer_index = -1;
         }
         return ESP_OK;
-    }
-
-    if (display_hal_panel_requires_swap() && !pixels_panel_order) {
-        pixel_count = (size_t)(x_end - x_start) * (size_t)(y_end - y_start);
-        ESP_RETURN_ON_FALSE(s_state.submit_swap_buffer != NULL, ESP_ERR_INVALID_STATE, TAG,
-                            "submit swap buffer missing");
-        swap_buffer = s_state.submit_swap_buffer;
-        display_hal_bswap16_into(swap_buffer, pixels, pixel_count);
-        submit_pixels = swap_buffer;
     }
 
     ret = esp_lcd_panel_draw_bitmap(s_state.panel, x_start, y_start, x_end, y_end, submit_pixels);
@@ -792,11 +854,47 @@ static esp_err_t display_hal_submit_bitmap_locked_ex(int x_start, int y_start,
 
     s_state.flush_in_flight = true;
     s_state.pending_framebuffer_index = (int8_t)pending_framebuffer_index;
+    s_state.in_flight_submit_swap_buffer_index = submit_swap_buffer_index;
+    if (submit_swap_buffer_index >= 0 && s_state.submit_swap_buffer_count > 0) {
+        s_state.next_submit_swap_buffer_index =
+            (uint8_t)(((uint8_t)submit_swap_buffer_index + 1) % s_state.submit_swap_buffer_count);
+    }
 
     if (wait_for_done) {
         ret = display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS));
     }
     return ret;
+}
+
+static esp_err_t display_hal_submit_bitmap_locked_ex(int x_start, int y_start,
+                                                     int x_end, int y_end,
+                                                     const uint16_t *pixels,
+                                                     int pending_framebuffer_index,
+                                                     bool wait_for_done,
+                                                     bool pixels_panel_order)
+{
+    const uint16_t *submit_pixels = pixels;
+    size_t pixel_count = 0;
+    uint16_t *swap_buffer = NULL;
+    int8_t submit_swap_buffer_index = -1;
+    esp_err_t ret = display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (display_hal_panel_requires_swap() && !pixels_panel_order) {
+        pixel_count = (size_t)(x_end - x_start) * (size_t)(y_end - y_start);
+        ESP_RETURN_ON_ERROR(
+            display_hal_get_submit_swap_buffer_locked(pixel_count, false,
+                                                      &swap_buffer, &submit_swap_buffer_index),
+            TAG, "get submit swap buffer failed");
+        display_hal_bswap16_into(swap_buffer, pixels, pixel_count);
+        submit_pixels = swap_buffer;
+    }
+
+    return display_hal_submit_ready_bitmap_locked(x_start, y_start, x_end, y_end,
+                                                  submit_pixels, pending_framebuffer_index,
+                                                  wait_for_done, submit_swap_buffer_index);
 }
 
 static esp_err_t display_hal_submit_bitmap_locked(int x_start, int y_start,
@@ -1052,12 +1150,120 @@ static void display_hal_crop_flip_bswap16_into(uint16_t *dst,
     }
 }
 
+static void display_hal_draw_overlay_pixel(uint16_t *dst,
+                                           int dst_width,
+                                           int x,
+                                           int y,
+                                           display_color_t color,
+                                           bool panel_order)
+{
+    uint16_t *pixel = dst + ((size_t)y * dst_width) + x;
+    uint16_t src565 = display_color_to_rgb565(color);
+
+    if (!display_color_is_opaque(color)) {
+        uint16_t dst565 = panel_order ? __builtin_bswap16(*pixel) : *pixel;
+        src565 = display_color_blend_rgb565(dst565, color);
+    }
+    *pixel = panel_order ? __builtin_bswap16(src565) : src565;
+}
+
+static void display_hal_draw_overlay_hline(uint16_t *dst,
+                                           int dst_width,
+                                           int dst_height,
+                                           int x,
+                                           int y,
+                                           int width,
+                                           display_color_t color,
+                                           bool panel_order)
+{
+    if (y < 0 || y >= dst_height || width <= 0 || display_color_is_transparent(color)) {
+        return;
+    }
+    if (x < 0) {
+        width += x;
+        x = 0;
+    }
+    if (x + width > dst_width) {
+        width = dst_width - x;
+    }
+    if (width <= 0) {
+        return;
+    }
+    for (int col = 0; col < width; ++col) {
+        display_hal_draw_overlay_pixel(dst, dst_width, x + col, y, color, panel_order);
+    }
+}
+
+static void display_hal_draw_overlay_vline(uint16_t *dst,
+                                           int dst_width,
+                                           int dst_height,
+                                           int x,
+                                           int y,
+                                           int height,
+                                           display_color_t color,
+                                           bool panel_order)
+{
+    if (x < 0 || x >= dst_width || height <= 0 || display_color_is_transparent(color)) {
+        return;
+    }
+    if (y < 0) {
+        height += y;
+        y = 0;
+    }
+    if (y + height > dst_height) {
+        height = dst_height - y;
+    }
+    if (height <= 0) {
+        return;
+    }
+    for (int row = 0; row < height; ++row) {
+        display_hal_draw_overlay_pixel(dst, dst_width, x, y + row, color, panel_order);
+    }
+}
+
+static void display_hal_draw_overlay_rect(uint16_t *dst,
+                                          int dst_width,
+                                          int dst_height,
+                                          const display_hal_bitmap_overlay_t *overlay,
+                                          bool panel_order)
+{
+    int x;
+    int y;
+    int width;
+    int height;
+
+    if (!dst || !overlay || !overlay->enabled ||
+            overlay->width <= 0 || overlay->height <= 0 ||
+            display_color_is_transparent(overlay->color)) {
+        return;
+    }
+
+    x = overlay->x;
+    y = overlay->y;
+    width = overlay->width;
+    height = overlay->height;
+    display_hal_draw_overlay_hline(dst, dst_width, dst_height, x, y, width, overlay->color, panel_order);
+    if (height > 1) {
+        display_hal_draw_overlay_hline(dst, dst_width, dst_height, x, y + height - 1,
+                                       width, overlay->color, panel_order);
+    }
+    if (height > 2) {
+        display_hal_draw_overlay_vline(dst, dst_width, dst_height, x, y + 1,
+                                       height - 2, overlay->color, panel_order);
+        if (width > 1) {
+            display_hal_draw_overlay_vline(dst, dst_width, dst_height, x + width - 1, y + 1,
+                                           height - 2, overlay->color, panel_order);
+        }
+    }
+}
+
 static esp_err_t display_hal_draw_bitmap_crop_flip_locked(int x, int y,
                                                           int src_x, int src_y,
                                                           int w, int h,
                                                           int src_width, int src_height,
                                                           const uint16_t *pixels,
-                                                          bool flip_y)
+                                                          bool flip_y,
+                                                          const display_hal_bitmap_overlay_t *overlay)
 {
     if (!pixels || src_width <= 0 || src_height <= 0 || w <= 0 || h <= 0) {
         return ESP_ERR_INVALID_ARG;
@@ -1101,25 +1307,44 @@ static esp_err_t display_hal_draw_bitmap_crop_flip_locked(int x, int y,
             uint16_t *dst = framebuffer + ((size_t)(y + row) * s_state.width) + x;
             memcpy(dst, src, (size_t)w * sizeof(uint16_t));
         }
+        if (overlay && overlay->enabled) {
+            display_hal_bitmap_overlay_t shifted = *overlay;
+            shifted.x += x;
+            shifted.y += y;
+            display_hal_draw_overlay_rect(framebuffer, s_state.width, s_state.height, &shifted, false);
+        }
         display_dirty_mark(&s_state.dirty, x, y, w, h);
         return ESP_OK;
     }
 
     if (display_hal_panel_requires_swap()) {
         size_t pixel_count = (size_t)w * (size_t)h;
-        ESP_RETURN_ON_FALSE(s_state.submit_swap_buffer != NULL, ESP_ERR_INVALID_STATE, TAG,
-                            "submit swap buffer missing");
-        ESP_RETURN_ON_FALSE(pixel_count <= s_state.submit_swap_buffer_pixels, ESP_ERR_INVALID_SIZE, TAG,
-                            "submit swap buffer too small");
-        display_hal_crop_flip_bswap16_into(s_state.submit_swap_buffer, pixels,
+        uint16_t *submit_swap_buffer = NULL;
+        int8_t submit_swap_buffer_index = -1;
+
+        ESP_RETURN_ON_ERROR(
+            display_hal_get_submit_swap_buffer_locked(pixel_count, true,
+                                                      &submit_swap_buffer,
+                                                      &submit_swap_buffer_index),
+            TAG, "get submit swap buffer failed");
+        display_hal_crop_flip_bswap16_into(submit_swap_buffer, pixels,
                                            src_width, src_x, src_y, w, h, flip_y);
-        return display_hal_submit_bitmap_locked_ex(x, y, x + w, y + h,
-                                                   s_state.submit_swap_buffer,
-                                                   -1, true, true);
+        display_hal_draw_overlay_rect(submit_swap_buffer, w, h, overlay, true);
+        return display_hal_submit_ready_bitmap_locked(x, y, x + w, y + h,
+                                                      submit_swap_buffer,
+                                                      -1, false,
+                                                      submit_swap_buffer_index);
     }
 
     if (!flip_y) {
-        return display_hal_draw_bitmap_crop_locked(x, y, src_x, src_y, w, h, src_width, src_height, pixels);
+        esp_err_t ret = display_hal_draw_bitmap_crop_locked(x, y, src_x, src_y, w, h,
+                                                            src_width, src_height, pixels);
+        if (ret == ESP_OK && overlay && overlay->enabled) {
+            ret = display_hal_draw_rect_locked(x + overlay->x, y + overlay->y,
+                                               overlay->width, overlay->height,
+                                               overlay->color);
+        }
+        return ret;
     }
 
     for (int row = 0; row < h; ++row) {
@@ -1128,6 +1353,11 @@ static esp_err_t display_hal_draw_bitmap_crop_flip_locked(int x, int y,
         ESP_RETURN_ON_ERROR(
             display_hal_submit_bitmap_locked(x, y + row, x + w, y + row + 1, row_ptr, -1, true),
             TAG, "submit flipped bitmap row failed");
+    }
+    if (overlay && overlay->enabled) {
+        return display_hal_draw_rect_locked(x + overlay->x, y + overlay->y,
+                                            overlay->width, overlay->height,
+                                            overlay->color);
     }
     return ESP_OK;
 }
@@ -2295,6 +2525,19 @@ esp_err_t display_hal_draw_bitmap_crop_flip(int x, int y,
                                             const uint16_t *pixels,
                                             bool flip_y)
 {
+    return display_hal_draw_bitmap_crop_flip_overlay(x, y, src_x, src_y, w, h,
+                                                     src_width, src_height,
+                                                     pixels, flip_y, NULL);
+}
+
+esp_err_t display_hal_draw_bitmap_crop_flip_overlay(int x, int y,
+                                                    int src_x, int src_y,
+                                                    int w, int h,
+                                                    int src_width, int src_height,
+                                                    const uint16_t *pixels,
+                                                    bool flip_y,
+                                                    const display_hal_bitmap_overlay_t *overlay)
+{
     esp_err_t ret = display_hal_lock();
 
     if (ret != ESP_OK) {
@@ -2305,7 +2548,8 @@ esp_err_t display_hal_draw_bitmap_crop_flip(int x, int y,
     }
     if (ret == ESP_OK) {
         ret = display_hal_draw_bitmap_crop_flip_locked(x, y, src_x, src_y, w, h,
-                                                       src_width, src_height, pixels, flip_y);
+                                                       src_width, src_height, pixels,
+                                                       flip_y, overlay);
     }
     display_hal_unlock();
     return ret;

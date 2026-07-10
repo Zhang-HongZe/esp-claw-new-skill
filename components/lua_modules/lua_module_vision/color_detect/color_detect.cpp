@@ -1,5 +1,8 @@
 #include "color_detect.hpp"
 
+#include <algorithm>
+#include <cstdint>
+
 static const char *TAG = "ColorDetect";
 
 ColorDetectBase::ColorDetectBase(uint16_t width, uint16_t height) :
@@ -131,6 +134,46 @@ std::list<dl::detect::result_t> &ColorDetect::run(const dl::image::img_t &img)
     return m_result;
 }
 
+bool ColorDetect::run_best(const dl::image::img_t &img, int max_blob_pixels, box_result_t *out)
+{
+    if (out == nullptr) {
+        return false;
+    }
+
+    bool has_best = false;
+    box_result_t best = {};
+    int n = get_color_num();
+    if (n == 0) {
+        ESP_LOGE(TAG, "No color is registered. Please call register_color() first.");
+        return false;
+    }
+
+    dl::image::img_t hsv_mask_img = {
+        .data = m_hsv_mask, .width = m_width, .height = m_height, .pix_type = dl::image::DL_IMAGE_PIX_TYPE_HSV_MASK};
+    if (n == 1) {
+        m_T.reset().set_src_img(img).set_dst_img(hsv_mask_img).set_hsv_thr(m_hsv_min[0], m_hsv_max[0]).transform();
+        hsv_mask_process_best(
+            0, m_T.get_scale_x(true), m_T.get_scale_y(true), img.width, img.height, max_blob_pixels, &best, &has_best);
+    } else {
+        dl::image::img_t hsv_img = {
+            .data = m_hsv, .width = m_width, .height = m_height, .pix_type = dl::image::DL_IMAGE_PIX_TYPE_HSV};
+        m_T.reset().set_src_img(img).set_dst_img(hsv_img).transform();
+        float scale_x = m_T.get_scale_x(true);
+        float scale_y = m_T.get_scale_y(true);
+        m_T.reset().set_src_img(hsv_img).set_dst_img(hsv_mask_img);
+        for (int i = 0; i < n; i++) {
+            m_T.set_hsv_thr(m_hsv_min[i], m_hsv_max[i]).transform();
+            hsv_mask_process_best(
+                i, scale_x, scale_y, img.width, img.height, max_blob_pixels, &best, &has_best);
+        }
+    }
+
+    if (has_best) {
+        *out = best;
+    }
+    return has_best;
+}
+
 void ColorDetect::hsv_mask_process(
     int color_id, float inv_scale_x, float inv_scale_y, uint16_t limit_width, uint16_t limit_height)
 {
@@ -138,22 +181,152 @@ void ColorDetect::hsv_mask_process(
         cv::morphologyEx(m_hsv_mask_cvmat, m_hsv_mask_cvmat, cv::MORPH_OPEN, m_kernel);
         cv::morphologyEx(m_hsv_mask_cvmat, m_hsv_mask_cvmat, cv::MORPH_CLOSE, m_kernel);
     }
-    cv::Mat stats, centroids;
-    int num_labels =
-        cv::connectedComponentsWithStats(m_hsv_mask_cvmat, m_hsv_mask_label_cvmat, stats, centroids, 8, CV_16U);
-    for (int i = 1; i < num_labels; i++) {
-        auto p_stats = stats.ptr<int32_t>(i);
-        // auto p_centroids = centroids.ptr<double>(i);
-        if (p_stats[cv::CC_STAT_AREA] < m_area_thr[color_id]) {
+    scan_hsv_mask(color_id, inv_scale_x, inv_scale_y, limit_width, limit_height, 0, nullptr, nullptr, true);
+}
+
+void ColorDetect::hsv_mask_process_best(int color_id,
+                                        float inv_scale_x,
+                                        float inv_scale_y,
+                                        uint16_t limit_width,
+                                        uint16_t limit_height,
+                                        int max_blob_pixels,
+                                        box_result_t *best,
+                                        bool *has_best)
+{
+    if (m_morphology) {
+        cv::morphologyEx(m_hsv_mask_cvmat, m_hsv_mask_cvmat, cv::MORPH_OPEN, m_kernel);
+        cv::morphologyEx(m_hsv_mask_cvmat, m_hsv_mask_cvmat, cv::MORPH_CLOSE, m_kernel);
+    }
+    scan_hsv_mask(color_id,
+                  inv_scale_x,
+                  inv_scale_y,
+                  limit_width,
+                  limit_height,
+                  max_blob_pixels,
+                  best,
+                  has_best,
+                  false);
+}
+
+void ColorDetect::update_best_result(const box_result_t &candidate,
+                                     int max_blob_pixels,
+                                     box_result_t *best,
+                                     bool *has_best)
+{
+    if (best == nullptr || has_best == nullptr) {
+        return;
+    }
+    if (max_blob_pixels > 0 && candidate.area > max_blob_pixels) {
+        return;
+    }
+    if (!*has_best || candidate.area > best->area) {
+        *best = candidate;
+        *has_best = true;
+    }
+}
+
+void ColorDetect::scan_hsv_mask(int color_id,
+                                float inv_scale_x,
+                                float inv_scale_y,
+                                uint16_t limit_width,
+                                uint16_t limit_height,
+                                int max_blob_pixels,
+                                box_result_t *best,
+                                bool *has_best,
+                                bool collect_results)
+{
+    uint8_t *mask = static_cast<uint8_t *>(m_hsv_mask);
+    uint16_t *stack = static_cast<uint16_t *>(m_hsv_mask_label);
+    const int width = m_width;
+    const int height = m_height;
+    const int pixels = width * height;
+
+    if (mask == nullptr || stack == nullptr || pixels <= 0 || pixels > UINT16_MAX) {
+        ESP_LOGE(TAG, "Invalid color detect mask buffer.");
+        return;
+    }
+
+    for (int start = 0; start < pixels; start++) {
+        if (mask[start] == 0) {
             continue;
         }
-        int x1 = (int)(p_stats[cv::CC_STAT_LEFT] * inv_scale_x);
-        int y1 = (int)(p_stats[cv::CC_STAT_TOP] * inv_scale_y);
-        int x2 = (int)((p_stats[cv::CC_STAT_WIDTH] + p_stats[cv::CC_STAT_LEFT]) * inv_scale_x);
-        int y2 = (int)((p_stats[cv::CC_STAT_HEIGHT] + p_stats[cv::CC_STAT_TOP]) * inv_scale_y);
-        dl::detect::result_t res = {color_id, 1.f, {x1, y1, x2, y2}, {}};
-        res.limit_box(limit_width, limit_height);
-        m_result.push_back(res);
+
+        int top = 0;
+        int area = 0;
+        int min_x = width;
+        int min_y = height;
+        int max_x = 0;
+        int max_y = 0;
+
+        mask[start] = 0;
+        stack[top++] = static_cast<uint16_t>(start);
+        while (top > 0) {
+            const int offset = stack[--top];
+            const int x = offset % width;
+            const int y = offset / width;
+            area++;
+            min_x = std::min(min_x, x);
+            min_y = std::min(min_y, y);
+            max_x = std::max(max_x, x);
+            max_y = std::max(max_y, y);
+
+            for (int dy = -1; dy <= 1; dy++) {
+                const int ny = y + dy;
+                if (ny < 0 || ny >= height) {
+                    continue;
+                }
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const int nx = x + dx;
+                    if (nx < 0 || nx >= width) {
+                        continue;
+                    }
+                    const int next = ny * width + nx;
+                    if (mask[next] == 0) {
+                        continue;
+                    }
+                    mask[next] = 0;
+                    stack[top++] = static_cast<uint16_t>(next);
+                }
+            }
+        }
+
+        if (area < m_area_thr[color_id]) {
+            continue;
+        }
+
+        box_result_t candidate = {
+            .category = color_id,
+            .score = 1.f,
+            .left = static_cast<int>(min_x * inv_scale_x),
+            .top = static_cast<int>(min_y * inv_scale_y),
+            .right = static_cast<int>((max_x + 1) * inv_scale_x),
+            .bottom = static_cast<int>((max_y + 1) * inv_scale_y),
+            .area = 0,
+        };
+        candidate.left = DL_CLIP(candidate.left, 0, limit_width - 1);
+        candidate.top = DL_CLIP(candidate.top, 0, limit_height - 1);
+        candidate.right = DL_CLIP(candidate.right, 0, limit_width - 1);
+        candidate.bottom = DL_CLIP(candidate.bottom, 0, limit_height - 1);
+        candidate.area = std::max(0, candidate.right - candidate.left + 1) *
+                         std::max(0, candidate.bottom - candidate.top + 1);
+        if (candidate.area <= 0) {
+            continue;
+        }
+
+        if (collect_results) {
+            dl::detect::result_t res = {
+                candidate.category,
+                candidate.score,
+                {candidate.left, candidate.top, candidate.right, candidate.bottom},
+                {},
+            };
+            m_result.push_back(res);
+        } else {
+            update_best_result(candidate, max_blob_pixels, best, has_best);
+        }
     }
 }
 

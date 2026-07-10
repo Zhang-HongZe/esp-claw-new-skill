@@ -551,6 +551,7 @@ typedef struct {
     int src_w;
     int src_h;
     bool flip_y;
+    display_hal_bitmap_overlay_t overlay;
 } lua_display_image_options_t;
 
 static bool lua_display_get_table_integer(lua_State *L, int table_idx, const char *name, int *out)
@@ -631,6 +632,32 @@ static void lua_display_parse_source_rect(lua_State *L, int opts_idx, lua_displa
     lua_pop(L, 1);
 }
 
+static void lua_display_parse_overlay_rect(lua_State *L, int opts_idx, lua_display_image_options_t *opts)
+{
+    lua_getfield(L, opts_idx, "overlay_rect");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+    luaL_checktype(L, -1, LUA_TTABLE);
+    opts->overlay.enabled = true;
+    lua_display_get_table_integer(L, -1, "x", &opts->overlay.x);
+    lua_display_get_table_integer(L, -1, "y", &opts->overlay.y);
+    lua_display_get_table_integer(L, -1, "width", &opts->overlay.width);
+    lua_display_get_table_integer(L, -1, "height", &opts->overlay.height);
+
+    lua_getfield(L, -1, "color");
+    if (lua_isnil(L, -1)) {
+        opts->overlay.color = (display_color_t){ 0, 255, 0, 255 };
+    } else {
+        esp_err_t err = display_color_from_lua(L, -1, &opts->overlay.color);
+        if (err != ESP_OK) {
+            luaL_error(L, "display draw_image overlay_rect color invalid: %s", esp_err_to_name(err));
+        }
+    }
+    lua_pop(L, 2);
+}
+
 static void lua_display_parse_image_options(lua_State *L, int opts_idx, int src_w, int src_h, lua_display_image_options_t *opts)
 {
     memset(opts, 0, sizeof(*opts));
@@ -651,6 +678,7 @@ static void lua_display_parse_image_options(lua_State *L, int opts_idx, int src_
     lua_display_get_table_integer(L, opts_idx, "height", &opts->dst_h);
     lua_display_get_table_bool(L, opts_idx, "flip_y", &opts->flip_y);
     lua_display_parse_source_rect(L, opts_idx, opts);
+    lua_display_parse_overlay_rect(L, opts_idx, opts);
 }
 
 static esp_err_t lua_display_draw_pixels_fit_data(int x, int y, int src_width, int src_height,
@@ -782,8 +810,9 @@ static int lua_display_draw_image(lua_State *L)
             }
         }
         if (src_w == opts.dst_w && src_h == opts.dst_h) {
-            err = display_hal_draw_bitmap_crop_flip(x, y, src_x, src_y, src_w, src_h,
-                                                    view.width, view.height, pixels, opts.flip_y);
+            err = display_hal_draw_bitmap_crop_flip_overlay(x, y, src_x, src_y, src_w, src_h,
+                                                            view.width, view.height, pixels,
+                                                            opts.flip_y, &opts.overlay);
             out_w = src_w;
             out_h = src_h;
             break;

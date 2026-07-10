@@ -285,34 +285,6 @@ static esp_err_t lua_color_detect_copy_rgb565_crop_locked(const lua_image_view_t
     return ESP_OK;
 }
 
-static int lua_color_detect_box_area(const dl::detect::result_t &result)
-{
-    if (result.box.size() < 4) {
-        return 0;
-    }
-    const int width = std::max(0, result.box[2] - result.box[0] + 1);
-    const int height = std::max(0, result.box[3] - result.box[1] + 1);
-    return width * height;
-}
-
-static const dl::detect::result_t *lua_color_detect_select_largest_result(
-    const std::list<dl::detect::result_t> &results,
-    int max_blob_pixels)
-{
-    const dl::detect::result_t *best = nullptr;
-    int best_area = 0;
-
-    for (const auto &result : results) {
-        int area = lua_color_detect_box_area(result);
-        if (area <= 0 || area > max_blob_pixels || area <= best_area) {
-            continue;
-        }
-        best = &result;
-        best_area = area;
-    }
-    return best;
-}
-
 static int lua_color_detect_scale_min_pixels(const lua_color_detect_config_t *config)
 {
     const int source_pixels = config->source_width * config->source_height;
@@ -378,14 +350,14 @@ static void lua_color_detect_push_empty(lua_State *L, const lua_color_detect_con
 
 static void lua_color_detect_push_result(lua_State *L,
                                          const lua_color_detect_config_t *config,
-                                         const dl::detect::result_t *result,
+                                         const ColorDetect::box_result_t *result,
                                          int frame_width,
                                          int frame_height)
 {
-    const int left = config->source_x + result->box[0];
-    const int top = config->source_y + result->box[1];
-    const int right = config->source_x + result->box[2];
-    const int bottom = config->source_y + result->box[3];
+    const int left = config->source_x + result->left;
+    const int top = config->source_y + result->top;
+    const int right = config->source_x + result->right;
+    const int bottom = config->source_y + result->bottom;
     const int box_w = right - left + 1;
     const int box_h = bottom - top + 1;
     const int pixels = box_w * box_h;
@@ -454,7 +426,7 @@ static int lua_color_detect_detect(lua_State *L)
 {
     lua_image_view_t view = {};
     lua_color_detect_config_t config = {};
-    dl::detect::result_t best_result = {};
+    ColorDetect::box_result_t best_result = {};
     bool detected = false;
     uint16_t *crop = nullptr;
     const uint8_t *detect_data = nullptr;
@@ -507,12 +479,7 @@ static int lua_color_detect_detect(lua_State *L)
 
     err = lua_color_detect_prepare_detector(&config);
     if (err == ESP_OK) {
-        auto &results = s_detector->run(img);
-        const dl::detect::result_t *best = lua_color_detect_select_largest_result(results, config.max_blob_pixels);
-        if (best != nullptr) {
-            best_result = *best;
-            detected = true;
-        }
+        detected = s_detector->run_best(img, config.max_blob_pixels, &best_result);
     }
     xSemaphoreGive(mutex);
 

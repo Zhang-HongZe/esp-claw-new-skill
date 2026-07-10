@@ -37,14 +37,46 @@ protected:
 
 class ColorDetect : public ColorDetectBase {
 public:
+    typedef struct {
+        int category;
+        float score;
+        int left;
+        int top;
+        int right;
+        int bottom;
+        int area;
+    } box_result_t;
+
     ColorDetect(uint16_t width, uint16_t height);
     ~ColorDetect();
     void enable_morphology(int kernel_size = 5);
     std::list<dl::detect::result_t> &run(const dl::image::img_t &img);
+    bool run_best(const dl::image::img_t &img, int max_blob_pixels, box_result_t *out);
 
 private:
     void hsv_mask_process(
         int color_id, float inv_scale_x, float inv_scale_y, uint16_t limit_width, uint16_t limit_height);
+    void hsv_mask_process_best(int color_id,
+                               float inv_scale_x,
+                               float inv_scale_y,
+                               uint16_t limit_width,
+                               uint16_t limit_height,
+                               int max_blob_pixels,
+                               box_result_t *best,
+                               bool *has_best);
+    void scan_hsv_mask(int color_id,
+                       float inv_scale_x,
+                       float inv_scale_y,
+                       uint16_t limit_width,
+                       uint16_t limit_height,
+                       int max_blob_pixels,
+                       box_result_t *best,
+                       bool *has_best,
+                       bool collect_results);
+    void update_best_result(const box_result_t &candidate,
+                            int max_blob_pixels,
+                            box_result_t *best,
+                            bool *has_best);
     bool m_morphology;
     void *m_hsv_mask_label;
     cv::Mat m_hsv_mask_label_cvmat;

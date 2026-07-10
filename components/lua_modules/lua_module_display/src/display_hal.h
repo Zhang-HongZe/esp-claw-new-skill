@@ -48,6 +48,15 @@ typedef enum {
     DISPLAY_HAL_PANEL_IF_MIPI_DSI,
 } display_hal_panel_if_t;
 
+typedef struct {
+    bool enabled;
+    int x;
+    int y;
+    int width;
+    int height;
+    display_color_t color;
+} display_hal_bitmap_overlay_t;
+
 /* --- Lifecycle --- */
 
 esp_err_t display_hal_create(esp_lcd_panel_handle_t panel_handle,
@@ -127,6 +136,13 @@ esp_err_t display_hal_draw_bitmap_crop_flip(int x, int y,
                                             int src_width, int src_height,
                                             const uint16_t *pixels,
                                             bool flip_y);
+esp_err_t display_hal_draw_bitmap_crop_flip_overlay(int x, int y,
+                                                    int src_x, int src_y,
+                                                    int w, int h,
+                                                    int src_width, int src_height,
+                                                    const uint16_t *pixels,
+                                                    bool flip_y,
+                                                    const display_hal_bitmap_overlay_t *overlay);
 esp_err_t display_hal_draw_bitmap_scaled(int x, int y,
                                          const uint16_t *pixels,
                                          int src_width, int src_height,

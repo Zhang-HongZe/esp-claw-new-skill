@@ -339,9 +339,9 @@ local function compute_center_square_source_rect(src_w, src_h)
     return src_x, src_y, crop, crop
 end
 
-local function draw_detection_box(result, dst_x, dst_y, output_w, output_h, src_x, src_y, src_w, src_h)
+local function make_detection_overlay(result, output_w, output_h, src_x, src_y, src_w, src_h)
     if not result or result.detected ~= true or output_w <= 0 or output_h <= 0 or src_w <= 0 or src_h <= 0 then
-        return
+        return nil
     end
 
     local left = clamp(result.left, src_x, src_x + src_w - 1)
@@ -349,7 +349,7 @@ local function draw_detection_box(result, dst_x, dst_y, output_w, output_h, src_
     local top = clamp(result.top, src_y, src_y + src_h - 1)
     local bottom = clamp(result.bottom, src_y, src_y + src_h - 1)
     if right <= left or bottom <= top then
-        return
+        return nil
     end
 
     local scale_x = output_w / src_w
@@ -363,9 +363,13 @@ local function draw_detection_box(result, dst_x, dst_y, output_w, output_h, src_
         y = output_h - y - h
     end
 
-    display.draw_rect(dst_x + x, dst_y + y, w, h, "green")
-    display.draw_line(display.width // 2 - 8, display.height // 2, display.width // 2 + 8, display.height // 2, "white")
-    display.draw_line(display.width // 2, display.height // 2 - 8, display.width // 2, display.height // 2 + 8, "white")
+    return {
+        x = x,
+        y = y,
+        width = w,
+        height = h,
+        color = "green",
+    }
 end
 
 local function detect_color_range(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels, h_min, h_max)
@@ -388,27 +392,9 @@ local function detect_color_range(rgb565, src_x, src_y, src_w, src_h, max_blob_p
     })
 end
 
-local function detection_score(result)
-    if not result or result.detected ~= true then
-        return 0
-    end
-    return result.pixels or ((result.box_width or 0) * (result.box_height or 0))
-end
-
 local function detect_registered_color(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels)
-    if ctx.target_h_min <= ctx.target_h_max then
-        return detect_color_range(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels,
-                                  ctx.target_h_min, ctx.target_h_max)
-    end
-
-    local high = detect_color_range(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels,
-                                    ctx.target_h_min, 180)
-    local low = detect_color_range(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels,
-                                   0, ctx.target_h_max)
-    if detection_score(low) > detection_score(high) then
-        return low
-    end
-    return high
+    return detect_color_range(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels,
+                              ctx.target_h_min, ctx.target_h_max)
 end
 
 local function init_display()
@@ -532,6 +518,8 @@ local function run()
         if (frame_index % ctx.display_every_n) == 0 then
             t0 = system.millis()
             local dst_x = math.floor((display.width - src_w) / 2)
+            local overlay_rect = make_detection_overlay(detect_result, src_w, src_h,
+                                                         src_x, src_y, src_w, src_h)
             local output_w, output_h = display.draw_image(dst_x, 0, rgb565, {
                 mode = "crop",
                 source = {
@@ -543,9 +531,8 @@ local function run()
                 width = src_w,
                 height = src_h,
                 flip_y = ctx.display_flip_y,
+                overlay_rect = overlay_rect,
             })
-            draw_detection_box(detect_result, dst_x, 0, output_w or src_w, output_h or src_h,
-                               src_x, src_y, src_w, src_h)
             display_ms = system.millis() - t0
         end
 
