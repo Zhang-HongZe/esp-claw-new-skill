@@ -9,12 +9,19 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <list>
+#include <new>
 #include <string>
 #include <vector>
 
+#include "color_detect.hpp"
 #include "dl_image.hpp"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 extern "C" {
 #include "lauxlib.h"
@@ -22,6 +29,10 @@ extern "C" {
 }
 
 static const char *TAG = "lua_color_detect";
+
+#define LUA_COLOR_DETECT_WIDTH  100
+#define LUA_COLOR_DETECT_HEIGHT 100
+#define LUA_COLOR_DETECT_NAME   "target"
 
 typedef struct {
     int source_x;
@@ -34,14 +45,80 @@ typedef struct {
     std::array<uint8_t, 3> hsv_max;
 } lua_color_detect_config_t;
 
-typedef struct {
-    bool found;
-    int pixels;
-    int left;
-    int top;
-    int right;
-    int bottom;
-} lua_color_detect_box_t;
+static ColorDetect *s_detector;
+static StaticSemaphore_t s_detector_mutex_buffer;
+static SemaphoreHandle_t s_detector_mutex;
+static bool s_registered_color;
+static std::array<uint8_t, 3> s_registered_hsv_min;
+static std::array<uint8_t, 3> s_registered_hsv_max;
+static int s_registered_min_pixels;
+static uint16_t *s_crop_scratch;
+static size_t s_crop_scratch_pixels;
+
+static SemaphoreHandle_t lua_color_detect_get_mutex(void)
+{
+    if (s_detector_mutex == nullptr) {
+        s_detector_mutex = xSemaphoreCreateMutexStatic(&s_detector_mutex_buffer);
+    }
+    return s_detector_mutex;
+}
+
+static esp_err_t lua_color_detect_init_detector(void)
+{
+    if (s_detector != nullptr) {
+        return ESP_OK;
+    }
+
+    s_detector = new (std::nothrow) ColorDetect(LUA_COLOR_DETECT_WIDTH, LUA_COLOR_DETECT_HEIGHT);
+    if (s_detector == nullptr) {
+        ESP_LOGE(TAG, "detector alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static void lua_color_detect_release_crop_scratch_locked(void)
+{
+    heap_caps_free(s_crop_scratch);
+    s_crop_scratch = nullptr;
+    s_crop_scratch_pixels = 0;
+}
+
+static void lua_color_detect_release_detector_locked(void)
+{
+    delete s_detector;
+    s_detector = nullptr;
+    s_registered_color = false;
+    s_registered_min_pixels = 0;
+    lua_color_detect_release_crop_scratch_locked();
+}
+
+static esp_err_t lua_color_detect_ensure_crop_scratch_locked(size_t pixels, uint16_t **out)
+{
+    uint16_t *new_scratch = nullptr;
+
+    if (out == nullptr || pixels == 0 || pixels > SIZE_MAX / sizeof(uint16_t)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_crop_scratch != nullptr && s_crop_scratch_pixels >= pixels) {
+        *out = s_crop_scratch;
+        return ESP_OK;
+    }
+
+    new_scratch = static_cast<uint16_t *>(heap_caps_aligned_alloc(
+        16, pixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (new_scratch == nullptr) {
+        ESP_LOGE(TAG, "crop scratch alloc failed: %u bytes", (unsigned)(pixels * sizeof(uint16_t)));
+        return ESP_ERR_NO_MEM;
+    }
+
+    heap_caps_free(s_crop_scratch);
+    s_crop_scratch = new_scratch;
+    s_crop_scratch_pixels = pixels;
+    *out = s_crop_scratch;
+    ESP_LOGI(TAG, "crop scratch ready: %u bytes", (unsigned)(pixels * sizeof(uint16_t)));
+    return ESP_OK;
+}
 
 static bool lua_color_detect_get_integer_field(lua_State *L, int table_idx, const char *name, lua_Integer *out)
 {
@@ -161,8 +238,8 @@ static esp_err_t lua_color_detect_parse_config(lua_State *L,
         config->source_y + config->source_height > frame_height ||
         config->min_pixels <= 0 ||
         config->hsv_min[0] > 180 || config->hsv_max[0] > 180 ||
-        config->hsv_min[1] > config->hsv_max[1] ||
-        config->hsv_min[2] > config->hsv_max[2]) {
+        config->hsv_min[1] >= config->hsv_max[1] ||
+        config->hsv_min[2] >= config->hsv_max[2]) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -180,90 +257,102 @@ static esp_err_t lua_color_detect_parse_config(lua_State *L,
     return ESP_OK;
 }
 
-static lua_color_detect_box_t lua_color_detect_find_largest_component(const uint8_t *mask,
-                                                                      int width,
-                                                                      int height,
-                                                                      int min_pixels,
-                                                                      int max_blob_pixels)
+static bool lua_color_detect_needs_crop(const lua_color_detect_config_t *config, const lua_image_view_t *view)
 {
-    static const int neighbor_dx[] = {-1, 0, 1, -1, 1, -1, 0, 1};
-    static const int neighbor_dy[] = {-1, -1, -1, 0, 0, 1, 1, 1};
-    const int pixel_count = width * height;
-    std::vector<uint8_t> visited(static_cast<size_t>(pixel_count), 0);
-    std::vector<int> queue;
-    queue.reserve(static_cast<size_t>(std::min(pixel_count, max_blob_pixels + 1)));
+    return config->source_x != 0 || config->source_y != 0 ||
+           config->source_width != view->width || config->source_height != view->height;
+}
 
-    lua_color_detect_box_t best = {
-        .found = false,
-        .pixels = 0,
-        .left = 0,
-        .top = 0,
-        .right = -1,
-        .bottom = -1,
-    };
-
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            const int start_idx = y * width + x;
-            if (mask[start_idx] == 0 || visited[start_idx]) {
-                continue;
-            }
-
-            int comp_pixels = 0;
-            int left = width;
-            int top = height;
-            int right = -1;
-            int bottom = -1;
-            bool too_large = false;
-
-            queue.clear();
-            queue.push_back(start_idx);
-            visited[start_idx] = 1;
-
-            for (size_t head = 0; head < queue.size(); head++) {
-                const int idx = queue[head];
-                const int cx = idx % width;
-                const int cy = idx / width;
-                comp_pixels++;
-                if (comp_pixels > max_blob_pixels) {
-                    too_large = true;
-                    break;
-                }
-
-                left = std::min(left, cx);
-                top = std::min(top, cy);
-                right = std::max(right, cx);
-                bottom = std::max(bottom, cy);
-
-                for (int n = 0; n < 8; n++) {
-                    const int nx = cx + neighbor_dx[n];
-                    const int ny = cy + neighbor_dy[n];
-                    if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
-                        continue;
-                    }
-                    const int nidx = ny * width + nx;
-                    if (mask[nidx] == 0 || visited[nidx]) {
-                        continue;
-                    }
-                    visited[nidx] = 1;
-                    queue.push_back(nidx);
-                }
-            }
-
-            if (too_large || comp_pixels < min_pixels || comp_pixels <= best.pixels) {
-                continue;
-            }
-
-            best.found = true;
-            best.pixels = comp_pixels;
-            best.left = left;
-            best.top = top;
-            best.right = right;
-            best.bottom = bottom;
-        }
+static esp_err_t lua_color_detect_copy_rgb565_crop_locked(const lua_image_view_t *view,
+                                                          const lua_color_detect_config_t *config,
+                                                          uint16_t **out)
+{
+    const uint16_t *src = reinterpret_cast<const uint16_t *>(view->data);
+    const size_t pixels = static_cast<size_t>(config->source_width) * config->source_height;
+    uint16_t *crop = nullptr;
+    esp_err_t err = lua_color_detect_ensure_crop_scratch_locked(pixels, &crop);
+    if (err != ESP_OK) {
+        return err;
     }
 
+    for (int row = 0; row < config->source_height; row++) {
+        const uint16_t *src_row = src + (static_cast<size_t>(config->source_y + row) * view->width) +
+                                  config->source_x;
+        uint16_t *dst_row = crop + (static_cast<size_t>(row) * config->source_width);
+        memcpy(dst_row, src_row, static_cast<size_t>(config->source_width) * sizeof(uint16_t));
+    }
+    *out = crop;
+    return ESP_OK;
+}
+
+static int lua_color_detect_box_area(const dl::detect::result_t &result)
+{
+    if (result.box.size() < 4) {
+        return 0;
+    }
+    const int width = std::max(0, result.box[2] - result.box[0] + 1);
+    const int height = std::max(0, result.box[3] - result.box[1] + 1);
+    return width * height;
+}
+
+static const dl::detect::result_t *lua_color_detect_select_largest_result(
+    const std::list<dl::detect::result_t> &results,
+    int max_blob_pixels)
+{
+    const dl::detect::result_t *best = nullptr;
+    int best_area = 0;
+
+    for (const auto &result : results) {
+        int area = lua_color_detect_box_area(result);
+        if (area <= 0 || area > max_blob_pixels || area <= best_area) {
+            continue;
+        }
+        best = &result;
+        best_area = area;
+    }
     return best;
+}
+
+static int lua_color_detect_scale_min_pixels(const lua_color_detect_config_t *config)
+{
+    const int source_pixels = config->source_width * config->source_height;
+    const int detect_pixels = LUA_COLOR_DETECT_WIDTH * LUA_COLOR_DETECT_HEIGHT;
+    int scaled = (config->min_pixels * detect_pixels + source_pixels - 1) / source_pixels;
+    scaled = std::max(1, scaled);
+    return std::min(scaled, detect_pixels - 1);
+}
+
+static esp_err_t lua_color_detect_prepare_detector(const lua_color_detect_config_t *config)
+{
+    esp_err_t err = lua_color_detect_init_detector();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const int scaled_min_pixels = lua_color_detect_scale_min_pixels(config);
+    if (s_registered_color &&
+        s_registered_hsv_min == config->hsv_min &&
+        s_registered_hsv_max == config->hsv_max &&
+        s_registered_min_pixels == scaled_min_pixels) {
+        return ESP_OK;
+    }
+
+    while (s_detector->get_color_num() > 0) {
+        s_detector->delete_color(0);
+    }
+    s_detector->register_color(config->hsv_min,
+                               config->hsv_max,
+                               LUA_COLOR_DETECT_NAME,
+                               scaled_min_pixels);
+    if (s_detector->get_color_num() == 0) {
+        s_registered_color = false;
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_registered_color = true;
+    s_registered_hsv_min = config->hsv_min;
+    s_registered_hsv_max = config->hsv_max;
+    s_registered_min_pixels = scaled_min_pixels;
+    return ESP_OK;
 }
 
 static void lua_color_detect_push_empty(lua_State *L, const lua_color_detect_config_t *config, int frame_width, int frame_height)
@@ -289,33 +378,34 @@ static void lua_color_detect_push_empty(lua_State *L, const lua_color_detect_con
 
 static void lua_color_detect_push_result(lua_State *L,
                                          const lua_color_detect_config_t *config,
-                                         const lua_color_detect_box_t *box,
+                                         const dl::detect::result_t *result,
                                          int frame_width,
                                          int frame_height)
 {
-    const int left = config->source_x + box->left;
-    const int top = config->source_y + box->top;
-    const int right = config->source_x + box->right;
-    const int bottom = config->source_y + box->bottom;
+    const int left = config->source_x + result->box[0];
+    const int top = config->source_y + result->box[1];
+    const int right = config->source_x + result->box[2];
+    const int bottom = config->source_y + result->box[3];
     const int box_w = right - left + 1;
     const int box_h = bottom - top + 1;
-    const double cx = ((double)left + (double)right) * 0.5;
-    const double cy = ((double)top + (double)bottom) * 0.5;
+    const int pixels = box_w * box_h;
+    const double cx = (static_cast<double>(left) + static_cast<double>(right)) * 0.5;
+    const double cy = (static_cast<double>(top) + static_cast<double>(bottom)) * 0.5;
 
     lua_newtable(L);
     lua_pushinteger(L, 1);
     lua_setfield(L, -2, "count");
     lua_pushboolean(L, true);
     lua_setfield(L, -2, "detected");
-    lua_pushinteger(L, box->pixels);
+    lua_pushinteger(L, pixels);
     lua_setfield(L, -2, "pixels");
     lua_pushinteger(L, frame_width);
     lua_setfield(L, -2, "width");
     lua_pushinteger(L, frame_height);
     lua_setfield(L, -2, "height");
-    lua_pushinteger(L, 0);
+    lua_pushinteger(L, result->category);
     lua_setfield(L, -2, "category");
-    lua_pushnumber(L, 1.0);
+    lua_pushnumber(L, result->score);
     lua_setfield(L, -2, "score");
 
     lua_pushinteger(L, config->source_x);
@@ -362,8 +452,15 @@ static void lua_color_detect_push_result(lua_State *L,
 
 static int lua_color_detect_detect(lua_State *L)
 {
-    lua_image_view_t view = {0};
+    lua_image_view_t view = {};
     lua_color_detect_config_t config = {};
+    dl::detect::result_t best_result = {};
+    bool detected = false;
+    uint16_t *crop = nullptr;
+    const uint8_t *detect_data = nullptr;
+    int detect_width = 0;
+    int detect_height = 0;
+
     esp_err_t err = lua_image_require_format(L, 1, LUA_IMAGE_FORMAT_RGB565LE, &view);
     if (err != ESP_OK) {
         return luaL_error(L, "color_detect unsupported frame: %s", esp_err_to_name(err));
@@ -375,57 +472,89 @@ static int lua_color_detect_detect(lua_State *L)
         return luaL_error(L, "invalid color_detect options");
     }
 
-    std::vector<uint8_t> mask(static_cast<size_t>(config.source_width) * config.source_height, 0);
-    dl::image::img_t src_img = {
-        .data = const_cast<uint8_t *>(view.data),
-        .width = static_cast<uint16_t>(view.width),
-        .height = static_cast<uint16_t>(view.height),
-        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE,
-    };
-    dl::image::img_t mask_img = {
-        .data = mask.data(),
-        .width = static_cast<uint16_t>(config.source_width),
-        .height = static_cast<uint16_t>(config.source_height),
-        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_HSV_MASK,
-    };
-
-    dl::image::ImageTransformer transformer;
-    transformer.set_src_img(src_img)
-        .set_dst_img(mask_img)
-        .set_src_img_crop_area({
-            config.source_x,
-            config.source_y,
-            config.source_x + config.source_width,
-            config.source_y + config.source_height,
-        })
-        .set_hsv_thr(config.hsv_min, config.hsv_max);
-
-    err = transformer.transform();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ImageTransformer failed: %s", esp_err_to_name(err));
+    SemaphoreHandle_t mutex = lua_color_detect_get_mutex();
+    if (mutex == nullptr) {
         lua_image_release_view(&view);
-        return luaL_error(L, "color_detect transform failed: %s", esp_err_to_name(err));
+        return luaL_error(L, "color_detect mutex alloc failed");
     }
 
-    lua_color_detect_box_t box = lua_color_detect_find_largest_component(mask.data(),
-                                                                         config.source_width,
-                                                                         config.source_height,
-                                                                         config.min_pixels,
-                                                                         config.max_blob_pixels);
-    if (!box.found) {
+    if (xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) {
+        lua_image_release_view(&view);
+        return luaL_error(L, "color_detect lock failed");
+    }
+
+    detect_data = view.data;
+    detect_width = view.width;
+    detect_height = view.height;
+    if (lua_color_detect_needs_crop(&config, &view)) {
+        err = lua_color_detect_copy_rgb565_crop_locked(&view, &config, &crop);
+        if (err != ESP_OK) {
+            xSemaphoreGive(mutex);
+            lua_image_release_view(&view);
+            return luaL_error(L, "color_detect crop failed: %s", esp_err_to_name(err));
+        }
+        detect_data = reinterpret_cast<const uint8_t *>(crop);
+        detect_width = config.source_width;
+        detect_height = config.source_height;
+    }
+
+    dl::image::img_t img = {
+        .data = const_cast<uint8_t *>(detect_data),
+        .width = static_cast<uint16_t>(detect_width),
+        .height = static_cast<uint16_t>(detect_height),
+        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE,
+    };
+
+    err = lua_color_detect_prepare_detector(&config);
+    if (err == ESP_OK) {
+        auto &results = s_detector->run(img);
+        const dl::detect::result_t *best = lua_color_detect_select_largest_result(results, config.max_blob_pixels);
+        if (best != nullptr) {
+            best_result = *best;
+            detected = true;
+        }
+    }
+    xSemaphoreGive(mutex);
+
+    if (err != ESP_OK) {
+        lua_image_release_view(&view);
+        return luaL_error(L, "color_detect detector prepare failed: %s", esp_err_to_name(err));
+    }
+
+    if (!detected) {
         lua_color_detect_push_empty(L, &config, view.width, view.height);
     } else {
-        lua_color_detect_push_result(L, &config, &box, view.width, view.height);
+        lua_color_detect_push_result(L, &config, &best_result, view.width, view.height);
     }
 
     lua_image_release_view(&view);
     return 1;
 }
 
+static int lua_color_detect_release(lua_State *L)
+{
+    (void)L;
+    SemaphoreHandle_t mutex = lua_color_detect_get_mutex();
+    if (mutex == nullptr) {
+        return 0;
+    }
+    if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
+        lua_color_detect_release_detector_locked();
+        xSemaphoreGive(mutex);
+    }
+    return 0;
+}
+
 extern "C" int luaopen_color_detect_dl(lua_State *L)
 {
+    esp_err_t err = lua_color_detect_init_detector();
+    if (err != ESP_OK) {
+        return luaL_error(L, "color_detect init failed: %s", esp_err_to_name(err));
+    }
+
     static const luaL_Reg funcs[] = {
         {"detect", lua_color_detect_detect},
+        {"release", lua_color_detect_release},
         {NULL, NULL},
     };
     lua_newtable(L);

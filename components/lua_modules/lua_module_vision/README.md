@@ -5,7 +5,7 @@ Lua vision modules backed by `image.frame` buffers.
 ## Modules
 
 - `vision_motion_detect`: compares two `image.frame` objects and returns the number of changed sample points. Enabled by default with `LUA_MODULE_VISION_MOTION_DETECT`.
-- `color_detect`: uses ESP-DL `ImageTransformer` HSV mask generation plus connected-component filtering to detect a color blob in an `image.frame`. Enabled by default with `LUA_MODULE_VISION_COLOR_DETECT`.
+- `color_detect`: uses the ESP-DL `ColorDetect` implementation to detect a color blob in an `image.frame`. Enabled by default with `LUA_MODULE_VISION_COLOR_DETECT`.
 - `espdet`: runs ESP-DL ESPDet object detection from Lua with a user-provided `.espdl` model file. Enable with `LUA_MODULE_VISION_ESPDET`.
 
 All functions read the frame only during the call. Release frames with `frame:release()` after the vision call returns.
@@ -79,7 +79,7 @@ espdet.unload()
 - `vision_motion_detect.detect(frame1, frame2, opts)` compares two explicit frames.
 - `vision_motion_detect.reset()` clears the internal previous-frame copy.
 - Import color detection with `local color_detect = require("color_detect")`.
-- `color_detect.detect(frame, opts)` accepts an `image.frame`, internally requests RGB565LE through the shared `image` module, then uses ESP-DL HSV mask generation.
+- `color_detect.detect(frame, opts)` accepts an `image.frame`, internally requests RGB565LE through the shared `image` module, then runs ESP-DL `ColorDetect`.
 - Color detection defaults to green and returns `{ detected, count, left, top, right, bottom, x, y, box_width, box_height, cx, cy, pixels, width, height, source_x, source_y, source_width, source_height }`.
 - `opts` supports `source = { x, y, width, height }`, `min_pixels`, `max_blob_pixels`, `h_min`, `h_max`, `s_min`, `s_max`, `v_min`, and `v_max`. Hue values are in `[0, 180]`; saturation/value thresholds may be normalized `[0, 1]` or raw `[0, 255]`; defaults are tuned for green.
 - Import ESPDet with `local espdet = require("espdet")`.

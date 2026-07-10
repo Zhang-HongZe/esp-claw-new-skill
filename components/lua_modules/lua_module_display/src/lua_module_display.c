@@ -17,6 +17,7 @@
 #include "display_hal.h"
 #include "display_text.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "lauxlib.h"
 #include "lua_image.h"
@@ -28,6 +29,49 @@
 
 static const char *TAG = "lua_display";
 static char s_lua_display_owner_key;
+static uint16_t *s_crop_scratch;
+static size_t s_crop_scratch_pixels;
+
+static void lua_display_release_crop_scratch(void)
+{
+    heap_caps_free(s_crop_scratch);
+    s_crop_scratch = NULL;
+    s_crop_scratch_pixels = 0;
+}
+
+static esp_err_t lua_display_ensure_crop_scratch(size_t pixels, uint16_t **out)
+{
+    uint16_t *new_scratch = NULL;
+
+    if (out == NULL || pixels == 0 || pixels > SIZE_MAX / sizeof(uint16_t)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_crop_scratch != NULL && s_crop_scratch_pixels >= pixels) {
+        *out = s_crop_scratch;
+        return ESP_OK;
+    }
+
+    new_scratch = heap_caps_aligned_alloc(16, pixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (new_scratch == NULL) {
+        ESP_LOGE(TAG, "display crop scratch alloc failed: %u bytes",
+                 (unsigned)(pixels * sizeof(uint16_t)));
+        return ESP_ERR_NO_MEM;
+    }
+
+    heap_caps_free(s_crop_scratch);
+    s_crop_scratch = new_scratch;
+    s_crop_scratch_pixels = pixels;
+    *out = s_crop_scratch;
+    ESP_LOGI(TAG, "display crop scratch ready: %u bytes", (unsigned)(pixels * sizeof(uint16_t)));
+    return ESP_OK;
+}
+
+static void lua_display_release_rgb565_crop(uint16_t *crop)
+{
+    if (crop != NULL && crop != s_crop_scratch) {
+        free(crop);
+    }
+}
 
 static bool lua_display_state_owns(lua_State *L)
 {
@@ -187,6 +231,7 @@ static void lua_display_exit_cleanup(lua_State *L)
     ESP_LOGI(TAG, "Lua exit cleanup: display still owned by Lua, releasing");
 
     if (display_hal_destroy() == ESP_OK) {
+        lua_display_release_crop_scratch();
         display_arbiter_release(DISPLAY_ARBITER_OWNER_LUA);
         lua_display_set_state_owns(L, false);
     }
@@ -229,6 +274,7 @@ static int lua_display_deinit(lua_State *L)
     if (err != ESP_OK) {
         return luaL_error(L, "display deinit failed: %s", esp_err_to_name(err));
     }
+    lua_display_release_crop_scratch();
 
     err = display_arbiter_release(DISPLAY_ARBITER_OWNER_LUA);
     if (err != ESP_OK) {
@@ -655,14 +701,16 @@ static esp_err_t lua_display_copy_rgb565_crop(const uint16_t *src, int src_width
                                               int crop_w, int crop_h, bool flip_y, uint16_t **out)
 {
     uint16_t *crop = NULL;
+    size_t pixels;
 
-    if (out == NULL || src == NULL || src_width <= 0 || crop_w <= 0 || crop_h <= 0) {
+    if (out == NULL || src == NULL || src_width <= 0 || crop_w <= 0 || crop_h <= 0 ||
+        (size_t)crop_w > SIZE_MAX / (size_t)crop_h) {
         return ESP_ERR_INVALID_ARG;
     }
-    crop = (uint16_t *)malloc((size_t)crop_w * (size_t)crop_h * sizeof(uint16_t));
-    if (crop == NULL) {
-        ESP_LOGE(TAG, "display crop buffer alloc failed: %dx%d", crop_w, crop_h);
-        return ESP_ERR_NO_MEM;
+    pixels = (size_t)crop_w * (size_t)crop_h;
+    esp_err_t err = lua_display_ensure_crop_scratch(pixels, &crop);
+    if (err != ESP_OK) {
+        return err;
     }
     for (int row = 0; row < crop_h; row++) {
         int source_row = flip_y ? (crop_h - 1 - row) : row;
@@ -733,8 +781,9 @@ static int lua_display_draw_image(lua_State *L)
                 src_h = new_h;
             }
         }
-        if (!opts.flip_y && src_w == opts.dst_w && src_h == opts.dst_h) {
-            err = display_hal_draw_bitmap_crop(x, y, src_x, src_y, src_w, src_h, view.width, view.height, pixels);
+        if (src_w == opts.dst_w && src_h == opts.dst_h) {
+            err = display_hal_draw_bitmap_crop_flip(x, y, src_x, src_y, src_w, src_h,
+                                                    view.width, view.height, pixels, opts.flip_y);
             out_w = src_w;
             out_h = src_h;
             break;
@@ -749,7 +798,7 @@ static int lua_display_draw_image(lua_State *L)
                 err = display_hal_draw_bitmap_scaled(x, y, crop, src_w, src_h, opts.dst_w, opts.dst_h, &out_w, &out_h);
             }
         }
-        free(crop);
+        lua_display_release_rgb565_crop(crop);
         break;
     }
     default:
@@ -853,7 +902,7 @@ static esp_err_t lua_display_draw_pixels_data(int x, int y, const uint16_t *pixe
             src_pixels = crop;
         }
         err = lua_display_draw_pixels_fit_data(x, y, opts->src_w, opts->src_h, opts->dst_w, opts->dst_h, src_pixels, out_w, out_h);
-        free(crop);
+        lua_display_release_rgb565_crop(crop);
         break;
     }
     case LUA_DISPLAY_IMAGE_STRETCH: {
@@ -869,7 +918,7 @@ static esp_err_t lua_display_draw_pixels_data(int x, int y, const uint16_t *pixe
             src_pixels = crop;
         }
         err = display_hal_draw_bitmap_scaled(x, y, src_pixels, opts->src_w, opts->src_h, opts->dst_w, opts->dst_h, out_w, out_h);
-        free(crop);
+        lua_display_release_rgb565_crop(crop);
         break;
     }
     case LUA_DISPLAY_IMAGE_CROP:
@@ -909,7 +958,7 @@ static esp_err_t lua_display_draw_pixels_data(int x, int y, const uint16_t *pixe
         if (err == ESP_OK) {
             err = display_hal_draw_bitmap_scaled(x, y, crop, src_w, src_h, dst_w, dst_h, out_w, out_h);
         }
-        free(crop);
+        lua_display_release_rgb565_crop(crop);
         break;
     }
     default:

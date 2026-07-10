@@ -17,9 +17,9 @@ menu "Lua Vision Module"
         bool "Enable color_detect Lua module"
         default y
         help
-            Build and register an ESP-DL-backed color_detect Lua module for
-            detecting colored blobs in image.frame values using ImageTransformer
-            HSV masks and connected-component filtering.
+            Build and register the ESP-DL color_detect Lua module for detecting
+            colored blobs in image.frame values using the migrated ColorDetect
+            implementation.
 
     config LUA_MODULE_VISION_ESPDET
         bool "Enable espdet Lua module"

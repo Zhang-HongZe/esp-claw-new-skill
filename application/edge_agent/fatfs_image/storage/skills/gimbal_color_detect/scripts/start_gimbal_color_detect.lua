@@ -291,6 +291,7 @@ local function apply_servo_targets()
 end
 
 local function cleanup()
+    pcall(color_detect.release)
     stop_servos()
     if display_started then
         pcall(display.end_frame)
@@ -531,15 +532,18 @@ local function run()
         if (frame_index % ctx.display_every_n) == 0 then
             t0 = system.millis()
             local dst_x = math.floor((display.width - src_w) / 2)
-            local display_frame <close> = image.crop(rgb565, {
-                x = src_x,
-                y = src_y,
+            local output_w, output_h = display.draw_image(dst_x, 0, rgb565, {
+                mode = "crop",
+                source = {
+                    x = src_x,
+                    y = src_y,
+                    width = src_w,
+                    height = src_h,
+                },
                 width = src_w,
                 height = src_h,
                 flip_y = ctx.display_flip_y,
-                format = image.RGB565,
             })
-            local output_w, output_h = display.draw_image(dst_x, 0, display_frame)
             draw_detection_box(detect_result, dst_x, 0, output_w or src_w, output_h or src_h,
                                src_x, src_y, src_w, src_h)
             display_ms = system.millis() - t0

@@ -121,6 +121,12 @@ esp_err_t display_hal_draw_bitmap_crop(int x, int y,
                                        int w, int h,
                                        int src_width, int src_height,
                                        const uint16_t *pixels);
+esp_err_t display_hal_draw_bitmap_crop_flip(int x, int y,
+                                            int src_x, int src_y,
+                                            int w, int h,
+                                            int src_width, int src_height,
+                                            const uint16_t *pixels,
+                                            bool flip_y);
 esp_err_t display_hal_draw_bitmap_scaled(int x, int y,
                                          const uint16_t *pixels,
                                          int src_width, int src_height,

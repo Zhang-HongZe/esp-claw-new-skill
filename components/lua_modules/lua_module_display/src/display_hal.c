@@ -80,6 +80,11 @@ static bool display_hal_flush_done_dpi_isr(esp_lcd_panel_handle_t panel,
 static esp_err_t display_hal_register_display_callbacks_locked(void);
 static esp_err_t display_hal_wait_flush_done_locked(TickType_t timeout_ticks);
 static bool display_hal_clip_rect_to_screen_locked(int *x, int *y, int *width, int *height);
+static esp_err_t display_hal_draw_bitmap_crop_locked(int x, int y,
+                                                     int src_x, int src_y,
+                                                     int w, int h,
+                                                     int src_width, int src_height,
+                                                     const uint16_t *pixels);
 
 static esp_err_t display_hal_checked_rgb565_bytes(int width, int height, size_t *out_bytes)
 {
@@ -742,11 +747,12 @@ static esp_err_t display_hal_wait_flush_done_locked(TickType_t timeout_ticks)
     return ESP_OK;
 }
 
-static esp_err_t display_hal_submit_bitmap_locked(int x_start, int y_start,
-                                                  int x_end, int y_end,
-                                                  const uint16_t *pixels,
-                                                  int pending_framebuffer_index,
-                                                  bool wait_for_done)
+static esp_err_t display_hal_submit_bitmap_locked_ex(int x_start, int y_start,
+                                                     int x_end, int y_end,
+                                                     const uint16_t *pixels,
+                                                     int pending_framebuffer_index,
+                                                     bool wait_for_done,
+                                                     bool pixels_panel_order)
 {
     const uint16_t *submit_pixels = pixels;
     size_t pixel_count = 0;
@@ -770,7 +776,7 @@ static esp_err_t display_hal_submit_bitmap_locked(int x_start, int y_start,
         return ESP_OK;
     }
 
-    if (display_hal_panel_requires_swap()) {
+    if (display_hal_panel_requires_swap() && !pixels_panel_order) {
         pixel_count = (size_t)(x_end - x_start) * (size_t)(y_end - y_start);
         ESP_RETURN_ON_FALSE(s_state.submit_swap_buffer != NULL, ESP_ERR_INVALID_STATE, TAG,
                             "submit swap buffer missing");
@@ -791,6 +797,17 @@ static esp_err_t display_hal_submit_bitmap_locked(int x_start, int y_start,
         ret = display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS));
     }
     return ret;
+}
+
+static esp_err_t display_hal_submit_bitmap_locked(int x_start, int y_start,
+                                                  int x_end, int y_end,
+                                                  const uint16_t *pixels,
+                                                  int pending_framebuffer_index,
+                                                  bool wait_for_done)
+{
+    return display_hal_submit_bitmap_locked_ex(x_start, y_start, x_end, y_end,
+                                               pixels, pending_framebuffer_index,
+                                               wait_for_done, false);
 }
 
 static const esp_painter_basic_font_t *display_hal_get_font(uint8_t font_size)
@@ -1016,6 +1033,103 @@ static esp_err_t display_hal_draw_rect_locked(int x, int y, int width, int heigh
     ESP_RETURN_ON_ERROR(display_hal_draw_vline_locked(x, y + 1, height - 2, color), TAG,
                         "draw left failed");
     return display_hal_draw_vline_locked(x + width - 1, y + 1, height - 2, color);
+}
+
+static void display_hal_crop_flip_bswap16_into(uint16_t *dst,
+                                               const uint16_t *src,
+                                               int src_width,
+                                               int src_x,
+                                               int src_y,
+                                               int w,
+                                               int h,
+                                               bool flip_y)
+{
+    for (int row = 0; row < h; ++row) {
+        int source_row = flip_y ? (h - 1 - row) : row;
+        const uint16_t *src_row = src + ((size_t)(src_y + source_row) * src_width) + src_x;
+        uint16_t *dst_row = dst + ((size_t)row * w);
+        display_hal_bswap16_into(dst_row, src_row, (size_t)w);
+    }
+}
+
+static esp_err_t display_hal_draw_bitmap_crop_flip_locked(int x, int y,
+                                                          int src_x, int src_y,
+                                                          int w, int h,
+                                                          int src_width, int src_height,
+                                                          const uint16_t *pixels,
+                                                          bool flip_y)
+{
+    if (!pixels || src_width <= 0 || src_height <= 0 || w <= 0 || h <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (src_x < 0) {
+        x -= src_x;
+        w += src_x;
+        src_x = 0;
+    }
+    if (src_y < 0) {
+        y -= src_y;
+        h += src_y;
+        src_y = 0;
+    }
+    if (src_x + w > src_width) {
+        w = src_width - src_x;
+    }
+    if (src_y + h > src_height) {
+        h = src_height - src_y;
+    }
+    if (w <= 0 || h <= 0) {
+        return ESP_OK;
+    }
+
+    if (!display_hal_clip_rect_locked(&x, &y, &w, &h, &src_x, &src_y)) {
+        return ESP_OK;
+    }
+
+    uint16_t *framebuffer = display_hal_get_draw_framebuffer_locked();
+    if (s_state.frame_active && framebuffer) {
+        if (s_state.flush_in_flight &&
+            s_state.pending_framebuffer_index == (int8_t)s_state.draw_framebuffer_index) {
+            ESP_RETURN_ON_ERROR(
+                display_hal_wait_flush_done_locked(pdMS_TO_TICKS(DISPLAY_HAL_FLUSH_TIMEOUT_MS)),
+                TAG, "wait flush failed");
+        }
+        for (int row = 0; row < h; ++row) {
+            int source_row = flip_y ? (h - 1 - row) : row;
+            const uint16_t *src = pixels + ((size_t)(src_y + source_row) * src_width) + src_x;
+            uint16_t *dst = framebuffer + ((size_t)(y + row) * s_state.width) + x;
+            memcpy(dst, src, (size_t)w * sizeof(uint16_t));
+        }
+        display_dirty_mark(&s_state.dirty, x, y, w, h);
+        return ESP_OK;
+    }
+
+    if (display_hal_panel_requires_swap()) {
+        size_t pixel_count = (size_t)w * (size_t)h;
+        ESP_RETURN_ON_FALSE(s_state.submit_swap_buffer != NULL, ESP_ERR_INVALID_STATE, TAG,
+                            "submit swap buffer missing");
+        ESP_RETURN_ON_FALSE(pixel_count <= s_state.submit_swap_buffer_pixels, ESP_ERR_INVALID_SIZE, TAG,
+                            "submit swap buffer too small");
+        display_hal_crop_flip_bswap16_into(s_state.submit_swap_buffer, pixels,
+                                           src_width, src_x, src_y, w, h, flip_y);
+        return display_hal_submit_bitmap_locked_ex(x, y, x + w, y + h,
+                                                   s_state.submit_swap_buffer,
+                                                   -1, true, true);
+    }
+
+    if (!flip_y) {
+        return display_hal_draw_bitmap_crop_locked(x, y, src_x, src_y, w, h, src_width, src_height, pixels);
+    }
+
+    for (int row = 0; row < h; ++row) {
+        int source_row = h - 1 - row;
+        const uint16_t *row_ptr = pixels + ((size_t)(src_y + source_row) * src_width) + src_x;
+        ESP_RETURN_ON_ERROR(
+            display_hal_submit_bitmap_locked(x, y + row, x + w, y + row + 1, row_ptr, -1, true),
+            TAG, "submit flipped bitmap row failed");
+    }
+    return ESP_OK;
 }
 
 static esp_err_t display_hal_draw_bitmap_crop_locked(int x, int y,
@@ -2169,6 +2283,29 @@ esp_err_t display_hal_draw_bitmap_crop(int x, int y,
     }
     if (ret == ESP_OK) {
         ret = display_hal_draw_bitmap_crop_locked(x, y, src_x, src_y, w, h, src_width, src_height, pixels);
+    }
+    display_hal_unlock();
+    return ret;
+}
+
+esp_err_t display_hal_draw_bitmap_crop_flip(int x, int y,
+                                            int src_x, int src_y,
+                                            int w, int h,
+                                            int src_width, int src_height,
+                                            const uint16_t *pixels,
+                                            bool flip_y)
+{
+    esp_err_t ret = display_hal_lock();
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (ret == ESP_OK) {
+        ret = display_hal_ensure_display_locked();
+    }
+    if (ret == ESP_OK) {
+        ret = display_hal_draw_bitmap_crop_flip_locked(x, y, src_x, src_y, w, h,
+                                                       src_width, src_height, pixels, flip_y);
     }
     display_hal_unlock();
     return ret;
