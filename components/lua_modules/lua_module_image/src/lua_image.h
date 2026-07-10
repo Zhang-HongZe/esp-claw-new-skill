@@ -92,6 +92,9 @@ esp_err_t lua_image_require_format(lua_State *L, int frame_index, lua_image_form
  *
  * Exposes:
  *   image.convert(frame, format) -> image.frame view
+ *   image.crop(frame, opts) -> image.frame
+ *   image.resize(frame, opts) -> image.frame
+ *   image.rotate(frame, opts) -> image.frame
  *   image.load_file(path) -> image.frame
  *   image.save_file(path, frame)
  */

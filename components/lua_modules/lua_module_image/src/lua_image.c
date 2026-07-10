@@ -17,6 +17,8 @@
 #include "esp_jpeg_dec.h"
 #include "esp_log.h"
 #include "lauxlib.h"
+#include "lua_image_crop.h"
+#include "lua_image_rotate.h"
 #include "lua_image_resize.h"
 
 #define LUA_MODULE_IMAGE_NAME "image"
@@ -690,9 +692,9 @@ static int lua_module_image_convert(lua_State *L)
 /* Pick the resize output format. Caller may pin it through opts.format;
  * otherwise we mirror the source frame's logical channels (GRAY8 stays
  * gray, everything else lifts to RGB565LE). */
-static lua_image_format_t lua_image_resize_pick_output(lua_image_format_t source_format,
-                                                       bool format_explicit,
-                                                       lua_image_format_t requested)
+static lua_image_format_t lua_image_pick_transform_output(lua_image_format_t source_format,
+                                                          bool format_explicit,
+                                                          lua_image_format_t requested)
 {
     if (format_explicit) {
         return requested;
@@ -711,6 +713,31 @@ static bool lua_image_resize_parse_filter(const char *name, lua_image_resize_fil
         return true;
     }
     return false;
+}
+
+static int lua_image_read_angle(lua_State *L, int opts_index, const char *field_name, const char *api_name)
+{
+    int angle;
+
+    lua_getfield(L, opts_index, field_name);
+    angle = (int)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+    if (angle % 90 != 0) {
+        luaL_error(L, "%s angle must be a multiple of 90 degrees", api_name);
+    }
+    return angle;
+}
+
+static bool lua_image_read_optional_bool(lua_State *L, int opts_index, const char *field_name, bool default_value)
+{
+    bool value = default_value;
+
+    lua_getfield(L, opts_index, field_name);
+    if (!lua_isnil(L, -1)) {
+        value = lua_toboolean(L, -1);
+    }
+    lua_pop(L, 1);
+    return value;
 }
 
 /* image.resize(frame, opts)
@@ -775,7 +802,7 @@ static int lua_module_image_resize(lua_State *L)
     }
     lua_pop(L, 1);
 
-    output_format = lua_image_resize_pick_output(source_format, format_explicit, requested_format);
+    output_format = lua_image_pick_transform_output(source_format, format_explicit, requested_format);
     if (output_format != LUA_IMAGE_FORMAT_RGB565LE && output_format != LUA_IMAGE_FORMAT_GRAY8) {
         return luaL_error(L, "image.resize output format must be RGB565 or GRAY8, got %s",
                           lua_image_format_name(output_format));
@@ -826,6 +853,209 @@ static int lua_module_image_resize(lua_State *L)
         return luaL_error(L, "image.resize push frame failed: %s", esp_err_to_name(err));
     }
     /* Ownership transferred to the new frame's store; suppress release_view free. */
+    output_view.data = NULL;
+    output_view.bytes = 0;
+    output_view.owned = false;
+    return 1;
+}
+
+/* image.rotate(frame, opts)
+ * opts = { angle = 0|90|180|270, [format = image.RGB565|image.GRAY8] }
+ * Positive angles rotate clockwise. Returns a new image.frame backed by an
+ * independent store; the source frame and its cache are otherwise untouched. */
+static int lua_module_image_rotate(lua_State *L)
+{
+    lua_image_frame_ud_t *source = lua_image_check_frame(L, 1);
+    int angle;
+    lua_image_format_t requested_format = LUA_IMAGE_FORMAT_RGB565LE;
+    bool format_explicit = false;
+    lua_image_format_t source_format;
+    lua_image_format_t output_format;
+    const lua_image_buffer_t *intermediate;
+    lua_image_source_t intermediate_src;
+    lua_image_view_t intermediate_view;
+    lua_image_view_t output_view = {0};
+    lua_image_frame_info_t info = {0};
+    const char *fourcc;
+    esp_err_t err;
+
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    if (source->closed || source->store == NULL || source->store->closed) {
+        return luaL_error(L, "image.rotate source frame is released");
+    }
+    source_format = source->format;
+    angle = lua_image_read_angle(L, 2, "angle", "image.rotate");
+
+    lua_getfield(L, 2, "format");
+    if (!lua_isnil(L, -1)) {
+        lua_Integer fv = luaL_checkinteger(L, -1);
+        if (!lua_image_check_format_value(fv, &requested_format)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "image.rotate invalid format constant: %d", (int)fv);
+        }
+        format_explicit = true;
+    }
+    lua_pop(L, 1);
+
+    output_format = lua_image_pick_transform_output(source_format, format_explicit, requested_format);
+    if (output_format != LUA_IMAGE_FORMAT_RGB565LE && output_format != LUA_IMAGE_FORMAT_GRAY8) {
+        return luaL_error(L, "image.rotate output format must be RGB565 or GRAY8, got %s",
+                          lua_image_format_name(output_format));
+    }
+
+    err = lua_image_store_require_format(source->store, output_format);
+    if (err != ESP_OK) {
+        return luaL_error(L, "image.rotate source conversion failed: %s", esp_err_to_name(err));
+    }
+    intermediate = lua_image_store_get_buffer(source->store, output_format);
+    if (intermediate == NULL || !intermediate->valid || intermediate->data == NULL) {
+        return luaL_error(L, "image.rotate intermediate buffer missing after conversion");
+    }
+    err = lua_image_source_from_buffer(intermediate, output_format, &intermediate_src);
+    if (err != ESP_OK) {
+        return luaL_error(L, "image.rotate intermediate buffer borrow failed");
+    }
+    intermediate_view.data = intermediate_src.data;
+    intermediate_view.bytes = intermediate_src.bytes;
+    intermediate_view.width = intermediate_src.width;
+    intermediate_view.height = intermediate_src.height;
+    intermediate_view.format = output_format;
+    intermediate_view.owned = false;
+    strlcpy(intermediate_view.source_format, intermediate_src.source_format, sizeof(intermediate_view.source_format));
+
+    err = lua_image_rotate_view(&intermediate_view, angle, &output_view);
+    if (err != ESP_OK) {
+        return luaL_error(L, "image.rotate failed: %s", esp_err_to_name(err));
+    }
+
+    fourcc = lua_image_format_fourcc(output_format);
+    if (fourcc == NULL) {
+        lua_image_release_view(&output_view);
+        return luaL_error(L, "image.rotate internal format error");
+    }
+    info.width = output_view.width;
+    info.height = output_view.height;
+    info.bytes = output_view.bytes;
+    info.timestamp_us = intermediate->info.timestamp_us;
+    strlcpy(info.pixel_format, fourcc, sizeof(info.pixel_format));
+
+    err = lua_image_push_frame(L, output_view.data, output_view.bytes, &info, lua_image_free_owned_frame, NULL);
+    if (err != ESP_OK) {
+        lua_image_release_view(&output_view);
+        return luaL_error(L, "image.rotate push frame failed: %s", esp_err_to_name(err));
+    }
+    output_view.data = NULL;
+    output_view.bytes = 0;
+    output_view.owned = false;
+    return 1;
+}
+
+/* image.crop(frame, opts)
+ * opts = { x, y, width, height, [format = image.RGB565|image.GRAY8], [flip_y = false] }
+ * Returns a new image.frame backed by an independent store. */
+static int lua_module_image_crop(lua_State *L)
+{
+    lua_image_frame_ud_t *source = lua_image_check_frame(L, 1);
+    int src_x;
+    int src_y;
+    int crop_width;
+    int crop_height;
+    bool flip_y;
+    lua_image_format_t requested_format = LUA_IMAGE_FORMAT_RGB565LE;
+    bool format_explicit = false;
+    lua_image_format_t source_format;
+    lua_image_format_t output_format;
+    const lua_image_buffer_t *intermediate;
+    lua_image_source_t intermediate_src;
+    lua_image_view_t intermediate_view;
+    lua_image_view_t output_view = {0};
+    lua_image_frame_info_t info = {0};
+    const char *fourcc;
+    esp_err_t err;
+
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    if (source->closed || source->store == NULL || source->store->closed) {
+        return luaL_error(L, "image.crop source frame is released");
+    }
+    source_format = source->format;
+
+    lua_getfield(L, 2, "x");
+    src_x = (int)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 2, "y");
+    src_y = (int)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 2, "width");
+    crop_width = (int)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 2, "height");
+    crop_height = (int)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+    if (src_x < 0 || src_y < 0 || crop_width <= 0 || crop_height <= 0) {
+        return luaL_error(L, "image.crop x/y must be non-negative and width/height must be positive");
+    }
+    flip_y = lua_image_read_optional_bool(L, 2, "flip_y", false);
+
+    lua_getfield(L, 2, "format");
+    if (!lua_isnil(L, -1)) {
+        lua_Integer fv = luaL_checkinteger(L, -1);
+        if (!lua_image_check_format_value(fv, &requested_format)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "image.crop invalid format constant: %d", (int)fv);
+        }
+        format_explicit = true;
+    }
+    lua_pop(L, 1);
+
+    output_format = lua_image_pick_transform_output(source_format, format_explicit, requested_format);
+    if (output_format != LUA_IMAGE_FORMAT_RGB565LE && output_format != LUA_IMAGE_FORMAT_GRAY8) {
+        return luaL_error(L, "image.crop output format must be RGB565 or GRAY8, got %s",
+                          lua_image_format_name(output_format));
+    }
+
+    err = lua_image_store_require_format(source->store, output_format);
+    if (err != ESP_OK) {
+        return luaL_error(L, "image.crop source conversion failed: %s", esp_err_to_name(err));
+    }
+    intermediate = lua_image_store_get_buffer(source->store, output_format);
+    if (intermediate == NULL || !intermediate->valid || intermediate->data == NULL) {
+        return luaL_error(L, "image.crop intermediate buffer missing after conversion");
+    }
+    err = lua_image_source_from_buffer(intermediate, output_format, &intermediate_src);
+    if (err != ESP_OK) {
+        return luaL_error(L, "image.crop intermediate buffer borrow failed");
+    }
+    intermediate_view.data = intermediate_src.data;
+    intermediate_view.bytes = intermediate_src.bytes;
+    intermediate_view.width = intermediate_src.width;
+    intermediate_view.height = intermediate_src.height;
+    intermediate_view.format = output_format;
+    intermediate_view.owned = false;
+    strlcpy(intermediate_view.source_format, intermediate_src.source_format, sizeof(intermediate_view.source_format));
+
+    err = lua_image_crop_view(&intermediate_view, src_x, src_y, crop_width, crop_height, flip_y, &output_view);
+    if (err != ESP_OK) {
+        return luaL_error(L, "image.crop failed: %s", esp_err_to_name(err));
+    }
+
+    fourcc = lua_image_format_fourcc(output_format);
+    if (fourcc == NULL) {
+        lua_image_release_view(&output_view);
+        return luaL_error(L, "image.crop internal format error");
+    }
+    info.width = output_view.width;
+    info.height = output_view.height;
+    info.bytes = output_view.bytes;
+    info.timestamp_us = intermediate->info.timestamp_us;
+    strlcpy(info.pixel_format, fourcc, sizeof(info.pixel_format));
+
+    err = lua_image_push_frame(L, output_view.data, output_view.bytes, &info, lua_image_free_owned_frame, NULL);
+    if (err != ESP_OK) {
+        lua_image_release_view(&output_view);
+        return luaL_error(L, "image.crop push frame failed: %s", esp_err_to_name(err));
+    }
     output_view.data = NULL;
     output_view.bytes = 0;
     output_view.owned = false;
@@ -968,7 +1198,9 @@ int luaopen_image(lua_State *L)
 {
     static const luaL_Reg funcs[] = {
         {"convert", lua_module_image_convert},
+        {"crop", lua_module_image_crop},
         {"resize", lua_module_image_resize},
+        {"rotate", lua_module_image_rotate},
         {"load_file", lua_module_image_load_file},
         {"save_file", lua_module_image_save_file},
         {NULL, NULL},

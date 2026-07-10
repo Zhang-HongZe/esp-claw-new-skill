@@ -17,12 +17,6 @@ local DEFAULT_PERF_LOG_EVERY_N = 10
 local DEFAULT_DETECT_STRIDE = 4
 local DEFAULT_DETECT_MIN_PIXELS = 250
 local DEFAULT_DETECT_MAX_BLOB_PERCENT = 35
-local DEFAULT_GREEN_H_MIN = 50
-local DEFAULT_GREEN_H_MAX = 88
-local DEFAULT_GREEN_S_MIN = 0.31
-local DEFAULT_GREEN_S_MAX = 1.0
-local DEFAULT_GREEN_V_MIN = 0.20
-local DEFAULT_GREEN_V_MAX = 1.0
 local DEFAULT_DEADZONE_PX = 12
 local DEFAULT_X_GAIN = 0.035
 local DEFAULT_Y_GAIN = -0.035
@@ -43,6 +37,26 @@ local DEFAULT_Y_MIN_ANGLE = 10
 local DEFAULT_Y_MAX_ANGLE = 70
 local MIN_SERVO_DELTA_DEGREES = 0.05
 
+local COLOR_PRESETS = {
+    red = { h_min = 170, h_max = 10, s_min = 0.35, s_max = 1.0, v_min = 0.18, v_max = 1.0 },
+    orange = { h_min = 8, h_max = 24, s_min = 0.35, s_max = 1.0, v_min = 0.20, v_max = 1.0 },
+    yellow = { h_min = 22, h_max = 40, s_min = 0.28, s_max = 1.0, v_min = 0.25, v_max = 1.0 },
+    green = { h_min = 50, h_max = 88, s_min = 0.31, s_max = 1.0, v_min = 0.20, v_max = 1.0 },
+    cyan = { h_min = 82, h_max = 100, s_min = 0.25, s_max = 1.0, v_min = 0.18, v_max = 1.0 },
+    blue = { h_min = 95, h_max = 130, s_min = 0.28, s_max = 1.0, v_min = 0.18, v_max = 1.0 },
+    purple = { h_min = 128, h_max = 158, s_min = 0.25, s_max = 1.0, v_min = 0.18, v_max = 1.0 },
+}
+
+local COLOR_ALIASES = {
+    ["红色"] = "red",
+    ["橙色"] = "orange",
+    ["黄色"] = "yellow",
+    ["绿色"] = "green",
+    ["青色"] = "cyan",
+    ["蓝色"] = "blue",
+    ["紫色"] = "purple",
+}
+
 local display_started = false
 local camera_started = false
 local x_pwm
@@ -59,12 +73,6 @@ local ARG_SCHEMA = {
     detect_stride = arg_schema.int({ default = DEFAULT_DETECT_STRIDE, min = 1 }),
     detect_min_pixels = arg_schema.int({ default = DEFAULT_DETECT_MIN_PIXELS, min = 1 }),
     detect_max_blob_percent = arg_schema.int({ default = DEFAULT_DETECT_MAX_BLOB_PERCENT, min = 1, max = 100 }),
-    green_h_min = arg_schema.int({ default = DEFAULT_GREEN_H_MIN, min = 0, max = 180 }),
-    green_h_max = arg_schema.int({ default = DEFAULT_GREEN_H_MAX, min = 0, max = 180 }),
-    green_s_min = arg_schema.int({ default = DEFAULT_GREEN_S_MIN, min = 0, max = 1, floor = false }),
-    green_s_max = arg_schema.int({ default = DEFAULT_GREEN_S_MAX, min = 0, max = 1, floor = false }),
-    green_v_min = arg_schema.int({ default = DEFAULT_GREEN_V_MIN, min = 0, max = 1, floor = false }),
-    green_v_max = arg_schema.int({ default = DEFAULT_GREEN_V_MAX, min = 0, max = 1, floor = false }),
     deadzone_px = arg_schema.int({ default = DEFAULT_DEADZONE_PX, min = 0 }),
     x_gain = arg_schema.int({ default = DEFAULT_X_GAIN, floor = false }),
     y_gain = arg_schema.int({ default = DEFAULT_Y_GAIN, floor = false }),
@@ -101,6 +109,78 @@ local function clamp(value, min_value, max_value)
     return value
 end
 
+local function raw_arg(name)
+    if type(args) == "table" then
+        return args[name]
+    end
+    return nil
+end
+
+local function raw_number(name)
+    local value = raw_arg(name)
+    if type(value) == "number" then
+        return value
+    end
+    return nil
+end
+
+local function raw_string(name, default)
+    local value = raw_arg(name)
+    if type(value) == "string" and value ~= "" then
+        return value
+    end
+    return default
+end
+
+local function normalize_color_name(name)
+    local normalized = string.lower(tostring(name or "")):gsub("^%s+", ""):gsub("%s+$", "")
+    return COLOR_ALIASES[normalized] or normalized
+end
+
+local function has_custom_hsv()
+    return raw_number("target_h_min") ~= nil or raw_number("target_h_max") ~= nil or
+        raw_number("target_s_min") ~= nil or raw_number("target_s_max") ~= nil or
+        raw_number("target_v_min") ~= nil or raw_number("target_v_max") ~= nil
+end
+
+local function resolve_target_color()
+    local color_name = raw_string("target_color_name", raw_string("color_name", ""))
+    if color_name == "" and not has_custom_hsv() then
+        color_name = "green"
+    end
+    local preset = COLOR_PRESETS[normalize_color_name(color_name)]
+    local custom = has_custom_hsv()
+
+    if preset and not custom then
+        ctx.target_color_name = color_name
+        ctx.target_h_min = preset.h_min
+        ctx.target_h_max = preset.h_max
+        ctx.target_s_min = preset.s_min
+        ctx.target_s_max = preset.s_max
+        ctx.target_v_min = preset.v_min
+        ctx.target_v_max = preset.v_max
+        ctx.target_color_source = "preset"
+        return
+    end
+
+    ctx.target_color_name = color_name ~= "" and color_name or "custom"
+    ctx.target_h_min = raw_number("target_h_min") or (preset and preset.h_min)
+    ctx.target_h_max = raw_number("target_h_max") or (preset and preset.h_max)
+    ctx.target_s_min = raw_number("target_s_min") or (preset and preset.s_min) or 0.25
+    ctx.target_s_max = raw_number("target_s_max") or (preset and preset.s_max) or 1.0
+    ctx.target_v_min = raw_number("target_v_min") or (preset and preset.v_min) or 0.18
+    ctx.target_v_max = raw_number("target_v_max") or (preset and preset.v_max) or 1.0
+    ctx.target_color_source = preset and "preset+custom" or "custom"
+
+    if ctx.target_h_min == nil or ctx.target_h_max == nil then
+        error("custom target color requires target_h_min and target_h_max")
+    end
+end
+
+resolve_target_color()
+ctx.target_h_min = math.floor(ctx.target_h_min)
+ctx.target_h_max = math.floor(ctx.target_h_max)
+
 local function clamp_step(value, max_abs)
     if max_abs <= 0 then
         return value
@@ -128,11 +208,20 @@ local function validate_config()
     if ctx.y_min_angle > ctx.y_max_angle then
         error("y_min_angle must be <= y_max_angle")
     end
-    if ctx.green_s_min > ctx.green_s_max then
-        error("green_s_min must be <= green_s_max")
+    if ctx.target_h_min < 0 or ctx.target_h_min > 180 or ctx.target_h_max < 0 or ctx.target_h_max > 180 then
+        error("target_h_min/target_h_max must be in 0..180")
     end
-    if ctx.green_v_min > ctx.green_v_max then
-        error("green_v_min must be <= green_v_max")
+    if ctx.target_s_min < 0 or ctx.target_s_min > 1 or ctx.target_s_max < 0 or ctx.target_s_max > 1 then
+        error("target_s_min/target_s_max must be in 0..1")
+    end
+    if ctx.target_v_min < 0 or ctx.target_v_min > 1 or ctx.target_v_max < 0 or ctx.target_v_max > 1 then
+        error("target_v_min/target_v_max must be in 0..1")
+    end
+    if ctx.target_s_min > ctx.target_s_max then
+        error("target_s_min must be <= target_s_max")
+    end
+    if ctx.target_v_min > ctx.target_v_max then
+        error("target_v_min must be <= target_v_max")
     end
 end
 
@@ -278,6 +367,49 @@ local function draw_detection_box(result, dst_x, dst_y, output_w, output_h, src_
     display.draw_line(display.width // 2, display.height // 2 - 8, display.width // 2, display.height // 2 + 8, "white")
 end
 
+local function detect_color_range(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels, h_min, h_max)
+    return color_detect.detect(rgb565, {
+        stride = ctx.detect_stride,
+        min_pixels = ctx.detect_min_pixels,
+        max_blob_pixels = max_blob_pixels,
+        source = {
+            x = src_x,
+            y = src_y,
+            width = src_w,
+            height = src_h,
+        },
+        h_min = h_min,
+        h_max = h_max,
+        s_min = ctx.target_s_min,
+        s_max = ctx.target_s_max,
+        v_min = ctx.target_v_min,
+        v_max = ctx.target_v_max,
+    })
+end
+
+local function detection_score(result)
+    if not result or result.detected ~= true then
+        return 0
+    end
+    return result.pixels or ((result.box_width or 0) * (result.box_height or 0))
+end
+
+local function detect_registered_color(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels)
+    if ctx.target_h_min <= ctx.target_h_max then
+        return detect_color_range(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels,
+                                  ctx.target_h_min, ctx.target_h_max)
+    end
+
+    local high = detect_color_range(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels,
+                                    ctx.target_h_min, 180)
+    local low = detect_color_range(rgb565, src_x, src_y, src_w, src_h, max_blob_pixels,
+                                   0, ctx.target_h_max)
+    if detection_score(low) > detection_score(high) then
+        return low
+    end
+    return high
+end
+
 local function init_display()
     local panel_handle, io_handle, lcd_width, lcd_height, panel_if =
         board_manager.get_display_lcd_params("display_lcd")
@@ -328,8 +460,20 @@ local function run()
     local prev_frame_timestamp_us = nil
     local start_s = os.time()
     local deadline_s = ctx.run_seconds > 0 and (start_s + ctx.run_seconds) or nil
-    print(string.format("[gimbal_color_detect] start stream=%dx%d format=%s",
-        stream.width, stream.height, tostring(stream.pixel_format)))
+    print(string.format(
+        "[gimbal_color_detect] start stream=%dx%d format=%s target_color=%s source=%s hsv=(%s..%s, %.2f..%.2f, %.2f..%.2f)",
+        stream.width,
+        stream.height,
+        tostring(stream.pixel_format),
+        tostring(ctx.target_color_name),
+        tostring(ctx.target_color_source),
+        tostring(ctx.target_h_min),
+        tostring(ctx.target_h_max),
+        ctx.target_s_min,
+        ctx.target_s_max,
+        ctx.target_v_min,
+        ctx.target_v_max
+    ))
 
     while not deadline_s or os.time() < deadline_s do
         local loop_t0 = system.millis()
@@ -362,23 +506,8 @@ local function run()
         local max_blob_pixels = math.floor(src_w * src_h * ctx.detect_max_blob_percent / 100)
 
         t0 = system.millis()
-        local detected, detect_result_or_err = pcall(color_detect.detect, rgb565, {
-            stride = ctx.detect_stride,
-            min_pixels = ctx.detect_min_pixels,
-            max_blob_pixels = max_blob_pixels,
-            source = {
-                x = src_x,
-                y = src_y,
-                width = src_w,
-                height = src_h,
-            },
-            h_min = ctx.green_h_min,
-            h_max = ctx.green_h_max,
-            s_min = ctx.green_s_min,
-            s_max = ctx.green_s_max,
-            v_min = ctx.green_v_min,
-            v_max = ctx.green_v_max,
-        })
+        local detected, detect_result_or_err = pcall(detect_registered_color, rgb565,
+                                                     src_x, src_y, src_w, src_h, max_blob_pixels)
         local detect_ms = system.millis() - t0
         if not detected then
             error("color_detect.detect failed: " .. tostring(detect_result_or_err))
@@ -402,18 +531,15 @@ local function run()
         if (frame_index % ctx.display_every_n) == 0 then
             t0 = system.millis()
             local dst_x = math.floor((display.width - src_w) / 2)
-            local output_w, output_h = display.draw_image(dst_x, 0, rgb565, {
-                mode = "crop",
-                source = {
-                    x = src_x,
-                    y = src_y,
-                    width = src_w,
-                    height = src_h,
-                },
+            local display_frame <close> = image.crop(rgb565, {
+                x = src_x,
+                y = src_y,
                 width = src_w,
                 height = src_h,
                 flip_y = ctx.display_flip_y,
+                format = image.RGB565,
             })
+            local output_w, output_h = display.draw_image(dst_x, 0, display_frame)
             draw_detection_box(detect_result, dst_x, 0, output_w or src_w, output_h or src_h,
                                src_x, src_y, src_w, src_h)
             display_ms = system.millis() - t0

@@ -11,6 +11,11 @@ Shared image type and conversion helpers for Lua. Every frame produced by
   in the frame's shared store and returns a new `image.frame` view for that format.
 - `image.resize(frame, opts)` returns a new, independent `image.frame` scaled
   to `opts.width` x `opts.height`. See "Example: resize" below.
+- `image.rotate(frame, opts)` returns a new, independent `image.frame` rotated
+  clockwise by `opts.angle` degrees. See "Example: rotate" below.
+- `image.crop(frame, opts)` returns a new, independent `image.frame` cropped
+  from `opts.x`, `opts.y`, `opts.width`, and `opts.height`. See "Example:
+  crop" below.
 - `image.load_file(path)` reads an image file and returns an `image.frame`.
 - `image.save_file(path, frame)` saves a frame using the format implied by the
   file suffix.
@@ -92,6 +97,65 @@ end
 The converted result is a new `image.frame` view backed by the same shared
 store. Repeated conversions reuse cached buffers when possible. Release views
 with `<close>`, `frame:release()`, or GC.
+
+## Example: rotate
+
+`image.rotate(frame, opts)` returns a new, independent `image.frame`. Positive
+angles rotate clockwise. `opts.angle` must be a multiple of 90 degrees. Optional
+`opts.format` selects the output (`image.RGB565` or `image.GRAY8` only; defaults
+to RGB565, or GRAY8 when the source is already gray).
+
+```lua
+local image = require("image")
+
+do
+    local right <close> = image.rotate(frame, { angle = 90 })
+    local upside_down <close> = image.rotate(frame, { angle = 180 })
+
+    local gray_left <close> = image.rotate(frame, {
+        angle = -90,
+        format = image.GRAY8,
+    })
+end
+```
+
+Rotated frames do not share their output buffer with the source frame. Releasing
+the source frame does not invalidate rotated views that are still alive.
+
+## Example: crop
+
+`image.crop(frame, opts)` returns a new, independent `image.frame` for a
+zero-based source rectangle. Optional `opts.format` selects the output
+(`image.RGB565` or `image.GRAY8` only; defaults to RGB565, or GRAY8 when the
+source is already gray). Optional `opts.flip_y = true` vertically flips the crop
+while copying it, which is useful before drawing camera previews that need a
+fixed orientation.
+
+```lua
+local image = require("image")
+
+do
+    local square <close> = image.crop(frame, {
+        x = 200,
+        y = 0,
+        width = 240,
+        height = 240,
+        flip_y = true,
+    })
+
+    local gray_probe <close> = image.crop(frame, {
+        x = 0,
+        y = 0,
+        width = 96,
+        height = 96,
+        format = image.GRAY8,
+    })
+end
+```
+
+Cropped frames do not share their output buffer with the source frame.
+Releasing the source frame does not invalidate cropped views that are still
+alive.
 
 ## Example: resize
 

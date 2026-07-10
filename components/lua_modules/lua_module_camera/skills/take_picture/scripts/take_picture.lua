@@ -83,6 +83,17 @@ local function build_save_path()
   return storage.join_path(dir_path, ctx.filename)
 end
 
+local function ditto_requires_rotation()
+  local ok, board_info = pcall(board_manager.get_board_info)
+  if not ok or type(board_info) ~= "table" then
+    print("[take_picture] WARN: get_board_info failed; saving without board-specific rotation")
+    return false, ""
+  end
+
+  local board_name = tostring(board_info.name or "")
+  return board_name == "esp_Ditto" or board_name == "Ditto", board_name
+end
+
 -- 5. Cleanup
 local camera_opened = false
 
@@ -142,7 +153,18 @@ local function run()
 
   local frame <close> = camera.get_frame(ctx.timeout_ms)
   local frame_info = frame:info()
-  image.save_file(save_path, frame)
+  local rotate_180, board_name = ditto_requires_rotation()
+  local output_info = frame_info
+  local rotation = "none"
+
+  if rotate_180 then
+    local rotated <close> = image.rotate(frame, { angle = 180 })
+    output_info = rotated:info()
+    image.save_file(save_path, rotated)
+    rotation = "180"
+  else
+    image.save_file(save_path, frame)
+  end
 
   local saved_info, stat_err = storage.stat(save_path)
   if not saved_info then
@@ -150,12 +172,17 @@ local function run()
   end
 
   print(string.format(
-    "[take_picture] saved: path=%s bytes=%d frame=%dx%d format=%s timestamp_us=%d",
+    "[take_picture] saved: path=%s bytes=%d board=%s rotation=%s skipped=%d frame=%dx%d output=%dx%d format=%s timestamp_us=%d",
     save_path,
     saved_info.size,
+    board_name ~= "" and board_name or "unknown",
+    rotation,
+    ctx.skip_frames,
     frame_info.width,
     frame_info.height,
-    tostring(frame_info.pixel_format),
+    output_info.width,
+    output_info.height,
+    tostring(output_info.pixel_format),
     frame_info.timestamp_us
   ))
 end

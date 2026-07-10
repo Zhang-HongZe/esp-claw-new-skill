@@ -20,6 +20,15 @@ Run exactly one script with `lua_run_script` after reading `board_hardware_info`
 If `lua_run_script` returns an error, report that error directly to the user.
 Do not retry with changed arguments or run another camera script in the same turn unless the user explicitly asks.
 
+## Board-Specific Orientation
+
+When the current board is `esp_Ditto` / Ditto, the camera frame must be rotated
+180 degrees before saving or otherwise outputting the image. The
+bundled script detects this board with `board_manager.get_board_info()` and
+applies `image.rotate(frame, { angle = 180 })` before `image.save_file(...)`.
+For other boards, save the captured frame without this extra rotation unless the
+board-specific hardware notes say otherwise.
+
 ## Script Args Schema
 
 ```json
@@ -89,4 +98,5 @@ Take a photo after discarding more warm-up frames:
 2. If no camera is listed, tell the user that the board does not declare a camera and stop.
 3. Choose a safe filename. Use the default unless the user requested a specific output name.
 4. Run `{CUR_SKILL_DIR}/scripts/take_picture.lua` with the selected `args`.
-5. Report the saved path, byte count, resolution, pixel format, skipped warm-up frames, and any error directly from the script output.
+5. For Ditto / `esp_Ditto`, expect the script to rotate the captured frame 180 degrees before saving.
+6. Report the saved path, byte count, output resolution, pixel format, skipped warm-up frames, rotation status, and any error directly from the script output.

@@ -1,6 +1,10 @@
 idf_component_register(
-    SRC_DIRS
-        "src"
+    SRCS
+        "src/lua_image.c"
+        "src/lua_image_convert.c"
+        "src/lua_image_crop.c"
+        "src/lua_image_resize.c"
+        "src/lua_image_rotate.c"
     INCLUDE_DIRS
         "src"
     REQUIRES
