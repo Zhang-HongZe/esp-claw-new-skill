@@ -13,12 +13,12 @@ local DEFAULT_DISPLAY_EVERY_N = 1
 local DEFAULT_DISPLAY_CROP_SIZE = 240
 local DEFAULT_DISPLAY_FLIP_Y = true
 local DEFAULT_PERF_LOG_EVERY_N = 30
-local DEFAULT_PIXEL_DIFF_THRESHOLD = 20
-local DEFAULT_ACTIVE_PIXEL_PERCENT = 3
+local DEFAULT_PIXEL_DIFF_THRESHOLD = 16
+local DEFAULT_ACTIVE_PIXEL_PERCENT = 1
 local DEFAULT_CONFIRM_FRAMES = 2
 local DEFAULT_HOLD_FRAMES = 3
 local DEFAULT_BLOCK_SIZE = 4
-local DEFAULT_BLOCK_HIT_PIXELS = 3
+local DEFAULT_BLOCK_HIT_PIXELS = 2
 local DEFAULT_BOX_PADDING = 8
 local DEFAULT_BOX_DEADBAND = 2
 local DEFAULT_BOX_SNAP_THRESHOLD = 24
@@ -268,16 +268,19 @@ local function run()
             local elapsed_ms = math.max(1, system.millis() - perf_start_ms)
             local fps = perf_frames * 1000 / elapsed_ms
             print(string.format(
-                "[gimbal_motion_detect] perf fps=%.1f avg_ms get=%.1f convert=%.1f detect=%.1f display=%.1f loop=%.1f alert=%s event=%s active=%d",
+                "[gimbal_motion_detect] perf fps=%.1f avg_ms get=%.1f convert=%.1f detect=%.1f display=%.1f loop=%.1f detected=%s alert=%s event=%s active=%d threshold=%d has_box=%s",
                 fps,
                 perf_get_ms / perf_frames,
                 perf_convert_ms / perf_frames,
                 perf_detect_ms / perf_frames,
                 perf_display_ms / perf_frames,
                 perf_loop_ms / perf_frames,
+                tostring(motion_result.detected),
                 tostring(motion_result.alert_active),
                 tostring(motion_result.event),
-                motion_result.active_pixels or 0
+                motion_result.active_pixels or 0,
+                motion_result.threshold_pixels or 0,
+                tostring(motion_result.has_box)
             ))
             perf_start_ms = system.millis()
             perf_frames = 0

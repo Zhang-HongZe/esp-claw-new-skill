@@ -30,7 +30,7 @@
 #endif
 #include "app_config.h"
 
-#define APP_ENABLE_MEM_LOG        (1)
+#define APP_ENABLE_MEM_LOG        (0)
 
 static const char *TAG = "app";
 

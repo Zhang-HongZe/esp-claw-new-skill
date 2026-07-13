@@ -64,16 +64,16 @@ Resets the singleton detector.
 
 - `roi`: `{ x, y, width, height }`; default is the whole frame. Flat fields
   `roi_x`, `roi_y`, `roi_width`, and `roi_height` are also accepted.
-- `pixel_diff_threshold`: luma difference threshold, default `20`.
+- `pixel_diff_threshold`: luma difference threshold, default `16`.
 - `active_pixel_percent`: percentage of changed ROI pixels required for raw
-  detection, default `3`.
+  detection, default `1`.
 - `confirm_frames`: consecutive positive frames needed before `alert_active`,
   default `2`.
 - `hold_frames`: frames to keep alert active after raw detection clears,
   default `3`.
 - `block_size`: edge length for motion blocks, default `4`.
 - `block_hit_pixels`: changed pixels needed to mark one block active for the
-  output box, default `3`.
+  output box, default `2`.
 - `box_padding`: pixels added around the raw active block box, default `8`.
 - `box_deadband`: ignore smoothed box edge changes up to this size, default `2`.
 - `box_snap_threshold`: snap box edges immediately for larger changes,
