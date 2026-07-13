@@ -44,9 +44,9 @@ and pass `target_h_min`, `target_h_max`, `target_s_min`, `target_s_max`,
 `target_v_min`, and `target_v_max`.
 
 The built-in `green` preset is used only when the user gives no color and also
-does not refer to a specific visible object. Hue uses `0..180`;
-saturation/value use normalized `0..1` values and are converted to ESP-DL's
-`0..255` HSV mask thresholds internally. If `target_h_min > target_h_max`, the
+does not refer to a specific visible object. HSV thresholds match ESP-DL:
+hue uses `0..180`, saturation uses `0..255`, and value uses `0..255`.
+If `target_h_min > target_h_max`, the
 script treats the hue range as wrapping through 0, which is useful for red
 targets.
 
@@ -132,16 +132,20 @@ not affect the tracked box.
       "description": "Custom registered target hue upper bound, 0..180. Values lower than target_h_min wrap through 0."
     },
     "target_s_min": {
-      "type": "number"
+      "type": "integer",
+      "description": "Custom registered target saturation lower bound, 0..255."
     },
     "target_s_max": {
-      "type": "number"
+      "type": "integer",
+      "description": "Custom registered target saturation upper bound, 0..255."
     },
     "target_v_min": {
-      "type": "number"
+      "type": "integer",
+      "description": "Custom registered target value lower bound, 0..255."
     },
     "target_v_max": {
-      "type": "number"
+      "type": "integer",
+      "description": "Custom registered target value upper bound, 0..255."
     },
     "deadzone_px": {
       "type": "integer",
@@ -214,10 +218,10 @@ Start tracking a custom AI-returned color:
     "target_color_name": "custom teal",
     "target_h_min": 78,
     "target_h_max": 92,
-    "target_s_min": 0.25,
-    "target_s_max": 1.0,
-    "target_v_min": 0.18,
-    "target_v_max": 1.0
+    "target_s_min": 64,
+    "target_s_max": 255,
+    "target_v_min": 46,
+    "target_v_max": 255
   },
   "timeout_ms": 0,
   "name": "gimbal_color_detect",

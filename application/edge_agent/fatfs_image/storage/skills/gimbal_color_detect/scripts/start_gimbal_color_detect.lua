@@ -38,13 +38,13 @@ local DEFAULT_Y_MAX_ANGLE = 70
 local MIN_SERVO_DELTA_DEGREES = 0.05
 
 local COLOR_PRESETS = {
-    red = { h_min = 170, h_max = 10, s_min = 0.35, s_max = 1.0, v_min = 0.18, v_max = 1.0 },
-    orange = { h_min = 8, h_max = 24, s_min = 0.35, s_max = 1.0, v_min = 0.20, v_max = 1.0 },
-    yellow = { h_min = 22, h_max = 40, s_min = 0.28, s_max = 1.0, v_min = 0.25, v_max = 1.0 },
-    green = { h_min = 50, h_max = 88, s_min = 0.31, s_max = 1.0, v_min = 0.20, v_max = 1.0 },
-    cyan = { h_min = 82, h_max = 100, s_min = 0.25, s_max = 1.0, v_min = 0.18, v_max = 1.0 },
-    blue = { h_min = 95, h_max = 130, s_min = 0.28, s_max = 1.0, v_min = 0.18, v_max = 1.0 },
-    purple = { h_min = 128, h_max = 158, s_min = 0.25, s_max = 1.0, v_min = 0.18, v_max = 1.0 },
+    red = { h_min = 170, h_max = 10, s_min = 130, s_max = 255, v_min = 130, v_max = 255 },
+    orange = { h_min = 8, h_max = 24, s_min = 89, s_max = 255, v_min = 51, v_max = 255 },
+    yellow = { h_min = 22, h_max = 40, s_min = 71, s_max = 255, v_min = 64, v_max = 255 },
+    green = { h_min = 50, h_max = 88, s_min = 79, s_max = 255, v_min = 51, v_max = 255 },
+    cyan = { h_min = 82, h_max = 100, s_min = 64, s_max = 255, v_min = 46, v_max = 255 },
+    blue = { h_min = 95, h_max = 130, s_min = 71, s_max = 255, v_min = 46, v_max = 255 },
+    purple = { h_min = 128, h_max = 158, s_min = 64, s_max = 255, v_min = 46, v_max = 255 },
 }
 
 local COLOR_ALIASES = {
@@ -166,10 +166,10 @@ local function resolve_target_color()
     ctx.target_color_name = color_name ~= "" and color_name or "custom"
     ctx.target_h_min = raw_number("target_h_min") or (preset and preset.h_min)
     ctx.target_h_max = raw_number("target_h_max") or (preset and preset.h_max)
-    ctx.target_s_min = raw_number("target_s_min") or (preset and preset.s_min) or 0.25
-    ctx.target_s_max = raw_number("target_s_max") or (preset and preset.s_max) or 1.0
-    ctx.target_v_min = raw_number("target_v_min") or (preset and preset.v_min) or 0.18
-    ctx.target_v_max = raw_number("target_v_max") or (preset and preset.v_max) or 1.0
+    ctx.target_s_min = raw_number("target_s_min") or (preset and preset.s_min) or 64
+    ctx.target_s_max = raw_number("target_s_max") or (preset and preset.s_max) or 255
+    ctx.target_v_min = raw_number("target_v_min") or (preset and preset.v_min) or 46
+    ctx.target_v_max = raw_number("target_v_max") or (preset and preset.v_max) or 255
     ctx.target_color_source = preset and "preset+custom" or "custom"
 
     if ctx.target_h_min == nil or ctx.target_h_max == nil then
@@ -180,6 +180,10 @@ end
 resolve_target_color()
 ctx.target_h_min = math.floor(ctx.target_h_min)
 ctx.target_h_max = math.floor(ctx.target_h_max)
+ctx.target_s_min = math.floor(ctx.target_s_min)
+ctx.target_s_max = math.floor(ctx.target_s_max)
+ctx.target_v_min = math.floor(ctx.target_v_min)
+ctx.target_v_max = math.floor(ctx.target_v_max)
 
 local function clamp_step(value, max_abs)
     if max_abs <= 0 then
@@ -211,11 +215,11 @@ local function validate_config()
     if ctx.target_h_min < 0 or ctx.target_h_min > 180 or ctx.target_h_max < 0 or ctx.target_h_max > 180 then
         error("target_h_min/target_h_max must be in 0..180")
     end
-    if ctx.target_s_min < 0 or ctx.target_s_min > 1 or ctx.target_s_max < 0 or ctx.target_s_max > 1 then
-        error("target_s_min/target_s_max must be in 0..1")
+    if ctx.target_s_min < 0 or ctx.target_s_min > 255 or ctx.target_s_max < 0 or ctx.target_s_max > 255 then
+        error("target_s_min/target_s_max must be in 0..255")
     end
-    if ctx.target_v_min < 0 or ctx.target_v_min > 1 or ctx.target_v_max < 0 or ctx.target_v_max > 1 then
-        error("target_v_min/target_v_max must be in 0..1")
+    if ctx.target_v_min < 0 or ctx.target_v_min > 255 or ctx.target_v_max < 0 or ctx.target_v_max > 255 then
+        error("target_v_min/target_v_max must be in 0..255")
     end
     if ctx.target_s_min > ctx.target_s_max then
         error("target_s_min must be <= target_s_max")
@@ -448,7 +452,7 @@ local function run()
     local start_s = os.time()
     local deadline_s = ctx.run_seconds > 0 and (start_s + ctx.run_seconds) or nil
     print(string.format(
-        "[gimbal_color_detect] start stream=%dx%d format=%s target_color=%s source=%s hsv=(%s..%s, %.2f..%.2f, %.2f..%.2f)",
+        "[gimbal_color_detect] start stream=%dx%d format=%s target_color=%s source=%s hsv=(%s..%s, %d..%d, %d..%d)",
         stream.width,
         stream.height,
         tostring(stream.pixel_format),
