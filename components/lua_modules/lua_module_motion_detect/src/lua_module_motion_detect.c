@@ -20,15 +20,16 @@
 #define LUA_MODULE_MOTION_DETECT_NAME "motion_detect"
 #define LUA_MOTION_DETECT_MT "motion_detect.detector"
 
-#define MOTION_DEFAULT_PIXEL_DIFF_THRESHOLD 24
-#define MOTION_DEFAULT_ACTIVE_PIXEL_PERCENT 5
+#define MOTION_DEFAULT_PIXEL_DIFF_THRESHOLD 20
+#define MOTION_DEFAULT_ACTIVE_PIXEL_PERCENT 3
 #define MOTION_DEFAULT_CONFIRM_FRAMES 2
 #define MOTION_DEFAULT_HOLD_FRAMES 3
 #define MOTION_DEFAULT_BLOCK_SIZE 4
-#define MOTION_DEFAULT_BLOCK_HIT_PIXELS 5
-#define MOTION_DEFAULT_BOX_PADDING 2
+#define MOTION_DEFAULT_BLOCK_HIT_PIXELS 3
+#define MOTION_DEFAULT_BOX_PADDING 8
 #define MOTION_DEFAULT_BOX_DEADBAND 2
 #define MOTION_DEFAULT_BOX_SNAP_THRESHOLD 24
+#define MOTION_COMPONENT_NEIGHBOR_RADIUS_BLOCKS 2
 
 static const char *TAG = "lua_motion_detect";
 
@@ -81,6 +82,7 @@ typedef struct {
     motion_detect_state_t state;
     uint8_t *prev_luma;
     uint8_t *block_counts;
+    uint32_t *block_stack;
     size_t prev_luma_size;
     size_t block_count;
     int frame_width;
@@ -203,8 +205,10 @@ static void motion_detector_release_buffers(lua_motion_detector_t *detector)
 {
     heap_caps_free(detector->prev_luma);
     heap_caps_free(detector->block_counts);
+    heap_caps_free(detector->block_stack);
     detector->prev_luma = NULL;
     detector->block_counts = NULL;
+    detector->block_stack = NULL;
     detector->prev_luma_size = 0;
     detector->block_count = 0;
     detector->frame_width = 0;
@@ -307,8 +311,14 @@ static bool motion_state_update(lua_motion_detector_t *detector, bool motion_det
 
 static inline uint8_t motion_rgb565_to_luma8(uint16_t pixel)
 {
+    uint8_t r5 = (uint8_t)((pixel >> 11) & 0x1f);
     uint8_t g6 = (uint8_t)((pixel >> 5) & 0x3f);
-    return (uint8_t)((g6 << 2) | (g6 >> 4));
+    uint8_t b5 = (uint8_t)(pixel & 0x1f);
+    uint8_t r8 = (uint8_t)((r5 << 3) | (r5 >> 2));
+    uint8_t g8 = (uint8_t)((g6 << 2) | (g6 >> 4));
+    uint8_t b8 = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+    return (uint8_t)((77U * r8 + 150U * g8 + 29U * b8 + 128U) >> 8);
 }
 
 static void motion_store_luma_roi(const uint16_t *src, uint8_t *dst,
@@ -324,11 +334,65 @@ static void motion_store_luma_roi(const uint16_t *src, uint8_t *dst,
     }
 }
 
+static int motion_min_int(int a, int b)
+{
+    return a < b ? a : b;
+}
+
+static int motion_max_int(int a, int b)
+{
+    return a > b ? a : b;
+}
+
+static uint32_t motion_box_overlap_area(int ax1, int ay1, int ax2, int ay2,
+                                        int bx1, int by1, int bx2, int by2)
+{
+    int x1 = motion_max_int(ax1, bx1);
+    int y1 = motion_max_int(ay1, by1);
+    int x2 = motion_min_int(ax2, bx2);
+    int y2 = motion_min_int(ay2, by2);
+
+    if (x2 < x1 || y2 < y1) {
+        return 0;
+    }
+    return (uint32_t)(x2 - x1 + 1) * (uint32_t)(y2 - y1 + 1);
+}
+
+static int64_t motion_component_score(uint32_t component_pixels,
+                                      int x1, int y1, int x2, int y2,
+                                      bool prefer_box,
+                                      int prefer_x1, int prefer_y1,
+                                      int prefer_x2, int prefer_y2)
+{
+    if (!prefer_box) {
+        return (int64_t)component_pixels;
+    }
+
+    uint32_t overlap = motion_box_overlap_area(x1, y1, x2, y2,
+                                               prefer_x1, prefer_y1,
+                                               prefer_x2, prefer_y2);
+    if (overlap > 0) {
+        return (1LL << 50) + ((int64_t)overlap * 4096) + (int64_t)component_pixels;
+    }
+
+    int64_t cx2 = (int64_t)x1 + (int64_t)x2;
+    int64_t cy2 = (int64_t)y1 + (int64_t)y2;
+    int64_t prefer_cx2 = (int64_t)prefer_x1 + (int64_t)prefer_x2;
+    int64_t prefer_cy2 = (int64_t)prefer_y1 + (int64_t)prefer_y2;
+    int64_t dx = cx2 - prefer_cx2;
+    int64_t dy = cy2 - prefer_cy2;
+    int64_t dist2 = dx * dx + dy * dy;
+
+    return (1LL << 40) - (dist2 * 1024) + (int64_t)component_pixels;
+}
+
 static motion_detect_result_t motion_detect_frame(const uint16_t *cur,
                                                   uint8_t *prev_luma,
                                                   uint8_t *block_counts,
+                                                  uint32_t *block_stack,
                                                   int frame_width,
-                                                  const motion_detect_config_t *config)
+                                                  const motion_detect_config_t *config,
+                                                  const motion_detect_state_t *state)
 {
     motion_detect_result_t result = {0};
     const int roi_x = config->roi_x;
@@ -363,6 +427,7 @@ static motion_detect_result_t motion_detect_frame(const uint16_t *cur,
 
             if (diff > config->pixel_diff_threshold) {
                 size_t block_index = block_row + (size_t)(x / config->block_size);
+                result.active_pixels++;
                 if (block_counts[block_index] < UINT8_MAX) {
                     block_counts[block_index]++;
                 }
@@ -370,48 +435,114 @@ static motion_detect_result_t motion_detect_frame(const uint16_t *cur,
         }
     }
 
-    for (int by = 0; by < blocks_y; by++) {
-        int block_y = by * config->block_size;
-        int block_h = roi_height - block_y;
-        if (block_h > config->block_size) {
-            block_h = config->block_size;
-        }
+    uint32_t best_component_pixels = 0;
+    int64_t best_component_score = 0;
+    bool has_best_component = false;
+    bool prefer_box = state != NULL && state->has_box;
+    int best_x1 = result.x1;
+    int best_y1 = result.y1;
+    int best_x2 = result.x2;
+    int best_y2 = result.y2;
 
-        for (int bx = 0; bx < blocks_x; bx++) {
-            int block_x = bx * config->block_size;
-            int block_w = roi_width - block_x;
-            if (block_w > config->block_size) {
-                block_w = config->block_size;
-            }
-
-            if (block_counts[(size_t)by * (size_t)blocks_x + (size_t)bx] < config->block_hit_pixels) {
+    for (int start_by = 0; start_by < blocks_y; start_by++) {
+        for (int start_bx = 0; start_bx < blocks_x; start_bx++) {
+            size_t start_index = (size_t)start_by * (size_t)blocks_x + (size_t)start_bx;
+            if (block_counts[start_index] < config->block_hit_pixels) {
                 continue;
             }
 
-            result.active_pixels += (uint32_t)block_w * (uint32_t)block_h;
-            result.has_box = true;
+            size_t top = 0;
+            uint32_t component_pixels = 0;
+            int component_x1 = roi_x + roi_width - 1;
+            int component_y1 = roi_y + roi_height - 1;
+            int component_x2 = roi_x;
+            int component_y2 = roi_y;
 
-            int block_x1 = roi_x + block_x;
-            int block_y1 = roi_y + block_y;
-            int block_x2 = block_x1 + block_w - 1;
-            int block_y2 = block_y1 + block_h - 1;
+            block_stack[top++] = (uint32_t)start_index;
+            block_counts[start_index] = 0;
+            while (top > 0) {
+                uint32_t block_index = block_stack[--top];
+                int by = (int)(block_index / (uint32_t)blocks_x);
+                int bx = (int)(block_index % (uint32_t)blocks_x);
+                int block_x = bx * config->block_size;
+                int block_y = by * config->block_size;
+                int block_w = roi_width - block_x;
+                int block_h = roi_height - block_y;
+                if (block_w > config->block_size) {
+                    block_w = config->block_size;
+                }
+                if (block_h > config->block_size) {
+                    block_h = config->block_size;
+                }
 
-            if (block_x1 < result.x1) {
-                result.x1 = block_x1;
+                component_pixels += (uint32_t)block_w * (uint32_t)block_h;
+
+                int block_x1 = roi_x + block_x;
+                int block_y1 = roi_y + block_y;
+                int block_x2 = block_x1 + block_w - 1;
+                int block_y2 = block_y1 + block_h - 1;
+                if (block_x1 < component_x1) {
+                    component_x1 = block_x1;
+                }
+                if (block_y1 < component_y1) {
+                    component_y1 = block_y1;
+                }
+                if (block_x2 > component_x2) {
+                    component_x2 = block_x2;
+                }
+                if (block_y2 > component_y2) {
+                    component_y2 = block_y2;
+                }
+
+                for (int dy = -MOTION_COMPONENT_NEIGHBOR_RADIUS_BLOCKS;
+                     dy <= MOTION_COMPONENT_NEIGHBOR_RADIUS_BLOCKS; dy++) {
+                    int ny = by + dy;
+                    if (ny < 0 || ny >= blocks_y) {
+                        continue;
+                    }
+                    for (int dx = -MOTION_COMPONENT_NEIGHBOR_RADIUS_BLOCKS;
+                         dx <= MOTION_COMPONENT_NEIGHBOR_RADIUS_BLOCKS; dx++) {
+                        int nx = bx + dx;
+                        if ((dx == 0 && dy == 0) || nx < 0 || nx >= blocks_x) {
+                            continue;
+                        }
+                        size_t next_index = (size_t)ny * (size_t)blocks_x + (size_t)nx;
+                        if (block_counts[next_index] < config->block_hit_pixels) {
+                            continue;
+                        }
+                        block_stack[top++] = (uint32_t)next_index;
+                        block_counts[next_index] = 0;
+                    }
+                }
             }
-            if (block_y1 < result.y1) {
-                result.y1 = block_y1;
-            }
-            if (block_x2 > result.x2) {
-                result.x2 = block_x2;
-            }
-            if (block_y2 > result.y2) {
-                result.y2 = block_y2;
+
+            int64_t component_score = motion_component_score(component_pixels,
+                                                             component_x1, component_y1,
+                                                             component_x2, component_y2,
+                                                             prefer_box,
+                                                             prefer_box ? state->x1 : 0,
+                                                             prefer_box ? state->y1 : 0,
+                                                             prefer_box ? state->x2 : 0,
+                                                             prefer_box ? state->y2 : 0);
+            if (!has_best_component || component_score > best_component_score) {
+                has_best_component = true;
+                best_component_score = component_score;
+                best_component_pixels = component_pixels;
+                best_x1 = component_x1;
+                best_y1 = component_y1;
+                best_x2 = component_x2;
+                best_y2 = component_y2;
             }
         }
     }
 
-    result.detected = result.active_pixels > threshold;
+    result.has_box = best_component_pixels > 0;
+    result.x1 = best_x1;
+    result.y1 = best_y1;
+    result.x2 = best_x2;
+    result.y2 = best_y2;
+
+    result.detected = result.has_box && result.active_pixels > threshold;
     if (!result.detected || !result.has_box) {
         result.has_box = false;
         return result;
@@ -484,7 +615,17 @@ static esp_err_t motion_detector_prepare(lua_motion_detector_t *detector,
     size_t luma_size = (size_t)config->roi_width * (size_t)config->roi_height;
     size_t blocks_x = (size_t)((config->roi_width + config->block_size - 1) / config->block_size);
     size_t blocks_y = (size_t)((config->roi_height + config->block_size - 1) / config->block_size);
+
+    if (blocks_y != 0 && blocks_x > SIZE_MAX / blocks_y) {
+        ESP_LOGE(TAG, "block count overflow: blocks=%zux%zu", blocks_x, blocks_y);
+        return ESP_ERR_INVALID_SIZE;
+    }
     size_t block_count = blocks_x * blocks_y;
+    if (block_count > UINT32_MAX || block_count > SIZE_MAX / sizeof(uint32_t)) {
+        ESP_LOGE(TAG, "block stack too large: blocks=%zu", block_count);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    size_t block_stack_bytes = block_count * sizeof(uint32_t);
 
     if (motion_config_buffers_match(detector, config, frame_width, frame_height)) {
         detector->config = *config;
@@ -494,9 +635,11 @@ static esp_err_t motion_detector_prepare(lua_motion_detector_t *detector,
     motion_detector_release_buffers(detector);
     detector->prev_luma = (uint8_t *)motion_alloc(luma_size);
     detector->block_counts = (uint8_t *)motion_alloc(block_count);
-    if (detector->prev_luma == NULL || detector->block_counts == NULL) {
+    detector->block_stack = (uint32_t *)motion_alloc(block_stack_bytes);
+    if (detector->prev_luma == NULL || detector->block_counts == NULL || detector->block_stack == NULL) {
         motion_detector_release_buffers(detector);
-        ESP_LOGE(TAG, "alloc buffers failed: luma=%zu blocks=%zu", luma_size, block_count);
+        ESP_LOGE(TAG, "alloc buffers failed: luma=%zu blocks=%zu stack=%zu",
+                 luma_size, block_count, block_stack_bytes);
         return ESP_ERR_NO_MEM;
     }
 
@@ -639,8 +782,8 @@ static int motion_detector_detect_impl(lua_State *L, lua_motion_detector_t *dete
             result.threshold_pixels = 1;
         }
     } else {
-        result = motion_detect_frame(pixels, detector->prev_luma, detector->block_counts,
-                                     view.width, &config);
+        result = motion_detect_frame(pixels, detector->prev_luma, detector->block_counts, detector->block_stack,
+                                     view.width, &config, &detector->state);
         alert_active = motion_state_update(detector, result.detected, &config, &event);
         if (result.detected && result.has_box) {
             motion_update_display_box(detector, &result, &config);

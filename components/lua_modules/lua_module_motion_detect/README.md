@@ -2,9 +2,10 @@
 
 `motion_detect` detects local motion in consecutive `image.frame` values. The
 algorithm is ported from `esp-halo-internal/example/lcd_ai_detect`: it compares
-RGB565 luma against the previous frame inside an ROI, groups changed pixels into
-blocks, pads the resulting box, and applies confirm/hold state to produce a
-stable alert.
+RGB565 weighted luma against the previous frame inside an ROI, counts changed
+pixels for the motion threshold, groups changed pixels into blocks for a stable
+box, pads the resulting box, and applies confirm/hold state to produce a stable
+alert.
 
 ## Usage
 
@@ -63,17 +64,17 @@ Resets the singleton detector.
 
 - `roi`: `{ x, y, width, height }`; default is the whole frame. Flat fields
   `roi_x`, `roi_y`, `roi_width`, and `roi_height` are also accepted.
-- `pixel_diff_threshold`: luma difference threshold, default `24`.
-- `active_pixel_percent`: percentage of active ROI pixels required for raw
-  detection, default `5`.
+- `pixel_diff_threshold`: luma difference threshold, default `20`.
+- `active_pixel_percent`: percentage of changed ROI pixels required for raw
+  detection, default `3`.
 - `confirm_frames`: consecutive positive frames needed before `alert_active`,
   default `2`.
 - `hold_frames`: frames to keep alert active after raw detection clears,
   default `3`.
 - `block_size`: edge length for motion blocks, default `4`.
-- `block_hit_pixels`: changed pixels needed to mark one block active,
-  default `5`.
-- `box_padding`: pixels added around the raw active block box, default `2`.
+- `block_hit_pixels`: changed pixels needed to mark one block active for the
+  output box, default `3`.
+- `box_padding`: pixels added around the raw active block box, default `8`.
 - `box_deadband`: ignore smoothed box edge changes up to this size, default `2`.
 - `box_snap_threshold`: snap box edges immediately for larger changes,
   default `24`.
@@ -86,8 +87,15 @@ The result table contains:
 - `detected`: raw motion decision for the current frame.
 - `alert_active`: confirm/hold state output.
 - `event`: `"none"`, `"activated"`, or `"cleared"`.
-- `active_pixels`, `threshold_pixels`.
+- `active_pixels`, `threshold_pixels`; these count changed pixels, not expanded
+  block area.
 - `positive_frames`, `hold_frames`.
 - `roi_x`, `roi_y`, `roi_width`, `roi_height`.
 - `raw_box`: raw detection box when present.
 - `box`: smoothed display box while available.
+
+The output box is computed from one connected active-block region. The component
+search allows a one-block gap so broken edges from the same moving object are
+merged. When a previous display box exists, the detector prefers overlapping or
+nearby components to avoid jumping between multiple moving objects; otherwise it
+starts from the largest component.
