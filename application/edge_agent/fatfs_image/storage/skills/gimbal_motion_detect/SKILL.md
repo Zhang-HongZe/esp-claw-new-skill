@@ -40,6 +40,10 @@ vertically, and draw it centered on the `284x240` LCD.
 - LCD panel: from `board_manager.get_display_lcd_params("display_lcd")`
 - Runtime shape: a single async Lua job owns camera, LCD preview, and motion detection.
 
+If the board manager camera path cannot be opened, the script tries
+`/dev/video0` through `/dev/video7` before failing and reports every attempted
+path.
+
 ## Start Script Args Schema
 
 ```json
@@ -49,7 +53,12 @@ vertically, and draw it centered on the `284x240` LCD.
     "run_seconds": {
       "type": "integer",
       "default": 0,
-      "description": "0 means run until the async Lua job is stopped."
+      "description": "0 means run until the async Lua job receives a cooperative stop request."
+    },
+    "capture_timeout_ms": {
+      "type": "integer",
+      "default": 500,
+      "description": "Camera frame wait timeout. Keep this short enough that stop requests can reach cleanup quickly."
     },
     "frame_interval_ms": {
       "type": "integer",
@@ -76,12 +85,12 @@ vertically, and draw it centered on the `284x240` LCD.
     },
     "pixel_diff_threshold": {
       "type": "integer",
-      "default": 24,
+      "default": 16,
       "description": "Per-pixel luma difference threshold."
     },
     "active_pixel_percent": {
       "type": "integer",
-      "default": 5,
+      "default": 1,
       "description": "Minimum active-pixel percentage inside the ROI required for raw motion."
     },
     "confirm_frames": {
@@ -98,11 +107,11 @@ vertically, and draw it centered on the `284x240` LCD.
     },
     "block_hit_pixels": {
       "type": "integer",
-      "default": 5
+      "default": 2
     },
     "box_padding": {
       "type": "integer",
-      "default": 2
+      "default": 8
     },
     "box_deadband": {
       "type": "integer",
@@ -139,6 +148,10 @@ Stop motion tracking:
   "wait_ms": 2000
 }
 ```
+
+Stop requests are handled by the Lua job executor. The script keeps the camera
+capture timeout short so stop can interrupt promptly, then runs camera,
+display, and detector cleanup from the script exit path.
 
 ## Recommended Flow
 

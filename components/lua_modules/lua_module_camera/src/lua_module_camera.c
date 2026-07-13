@@ -43,6 +43,20 @@ static void lua_module_camera_set_state_owns(lua_State *L, bool owns)
     lua_settable(L, LUA_REGISTRYINDEX);
 }
 
+static void lua_module_camera_exit_cleanup(lua_State *L)
+{
+    if (!lua_module_camera_state_owns(L)) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "Lua exit cleanup: camera still owned by this job, releasing");
+    esp_err_t err = camera_close_deferred("Lua exit cleanup");
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Lua exit cleanup: camera close request failed: %s", esp_err_to_name(err));
+    }
+    lua_module_camera_set_state_owns(L, false);
+}
+
 /* Camera-side release hook. The service can hold multiple borrowed buffers,
  * each identified by its data pointer; ctx is unused. */
 static void lua_module_camera_frame_release_cb(void *ctx, const uint8_t *data)
@@ -632,5 +646,9 @@ int luaopen_camera(lua_State *L)
 
 esp_err_t lua_module_camera_register(void)
 {
-    return cap_lua_register_module(LUA_MODULE_CAMERA_NAME, luaopen_camera);
+    esp_err_t err = cap_lua_register_module(LUA_MODULE_CAMERA_NAME, luaopen_camera);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return cap_lua_register_exit_cleanup(lua_module_camera_exit_cleanup);
 }

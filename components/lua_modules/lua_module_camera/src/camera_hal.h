@@ -98,6 +98,14 @@ esp_err_t camera_release_frame(void *frame_data);
 esp_err_t camera_close(void);
 
 /**
+ * @brief Close the camera now, or defer the close until borrowed frames return.
+ *
+ * This is intended for owner/task cleanup paths where Lua userdata may still
+ * hold camera buffers while the Lua state is being torn down.
+ */
+esp_err_t camera_close_deferred(const char *reason);
+
+/**
  * @brief Drop every queued capture buffer so the next get_frame returns a fresh capture.
  *
  * Fails with ESP_ERR_INVALID_STATE when the camera is not opened or one or

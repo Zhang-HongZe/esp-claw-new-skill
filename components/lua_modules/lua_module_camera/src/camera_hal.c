@@ -231,7 +231,7 @@ static void camera_close_locked(void)
 static void camera_close_or_defer_locked(const char *reason)
 {
     if (s_camera.borrowed_count > 0) {
-        ESP_LOGE(TAG, "%s; deferring camera close until %" PRIu32 " borrowed frame(s) are released", reason, s_camera.borrowed_count);
+        ESP_LOGW(TAG, "%s; deferring camera close until %" PRIu32 " borrowed frame(s) are released", reason, s_camera.borrowed_count);
         s_camera.close_pending = true;
         return;
     }
@@ -836,6 +836,19 @@ esp_err_t camera_close(void)
     }
 
     camera_close_locked();
+    camera_unlock();
+    return ESP_OK;
+}
+
+esp_err_t camera_close_deferred(const char *reason)
+{
+    esp_err_t err = camera_lock();
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    camera_close_or_defer_locked(reason != NULL ? reason : "close requested");
     camera_unlock();
     return ESP_OK;
 }

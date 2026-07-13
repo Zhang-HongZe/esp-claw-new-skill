@@ -8,7 +8,7 @@ local motion_detect = require("motion_detect")
 local system = require("system")
 
 local DEFAULT_FRAME_INTERVAL_MS = 0
-local DEFAULT_CAPTURE_TIMEOUT_MS = 3000
+local DEFAULT_CAPTURE_TIMEOUT_MS = 500
 local DEFAULT_DISPLAY_EVERY_N = 1
 local DEFAULT_DISPLAY_CROP_SIZE = 240
 local DEFAULT_DISPLAY_FLIP_Y = true
@@ -142,10 +142,43 @@ local function init_camera()
 
     -- Use the board default camera stream first. Some board sensors only expose
     -- one fixed mode, and forcing a reconfiguration can hide the real init error.
-    print("[gimbal_motion_detect] camera dev_path=" .. tostring(camera_paths.dev_path))
-    local opened, open_err = pcall(camera.open, camera_paths.dev_path)
+    print("[gimbal_motion_detect] camera dev_path=" .. tostring(camera_paths.dev_path) ..
+          " meta_path=" .. tostring(camera_paths.meta_path))
+
+    local tried = {}
+    local function try_open(path)
+        if not path or tried[path] then
+            return false, nil
+        end
+        tried[path] = true
+        local opened, open_err = pcall(camera.open, path)
+        if opened then
+            print("[gimbal_motion_detect] camera opened path=" .. tostring(path))
+            return true, nil
+        end
+        return false, tostring(open_err)
+    end
+
+    local open_errors = {}
+    local opened, open_err = try_open(camera_paths.dev_path)
+    if not opened and open_err then
+        open_errors[#open_errors + 1] = tostring(camera_paths.dev_path) .. ": " .. open_err
+    end
     if not opened then
-        error("camera.open failed: " .. tostring(open_err))
+        for index = 0, 7 do
+            local candidate = "/dev/video" .. tostring(index)
+            local candidate_opened, candidate_err = try_open(candidate)
+            if candidate_opened then
+                opened = true
+                break
+            end
+            if candidate_err then
+                open_errors[#open_errors + 1] = candidate .. ": " .. candidate_err
+            end
+        end
+    end
+    if not opened then
+        error("camera.open failed; tried " .. table.concat(open_errors, " | "))
     end
     camera_started = true
 
