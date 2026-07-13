@@ -13,13 +13,13 @@ local DEFAULT_DISPLAY_EVERY_N = 1
 local DEFAULT_DISPLAY_CROP_SIZE = 240
 local DEFAULT_DISPLAY_FLIP_Y = true
 local DEFAULT_PERF_LOG_EVERY_N = 30
-local DEFAULT_PIXEL_DIFF_THRESHOLD = 24
-local DEFAULT_ACTIVE_PIXEL_PERCENT = 5
+local DEFAULT_PIXEL_DIFF_THRESHOLD = 20
+local DEFAULT_ACTIVE_PIXEL_PERCENT = 3
 local DEFAULT_CONFIRM_FRAMES = 2
 local DEFAULT_HOLD_FRAMES = 3
 local DEFAULT_BLOCK_SIZE = 4
-local DEFAULT_BLOCK_HIT_PIXELS = 5
-local DEFAULT_BOX_PADDING = 2
+local DEFAULT_BLOCK_HIT_PIXELS = 3
+local DEFAULT_BOX_PADDING = 8
 local DEFAULT_BOX_DEADBAND = 2
 local DEFAULT_BOX_SNAP_THRESHOLD = 24
 
@@ -81,21 +81,14 @@ local function compute_center_square_source_rect(src_w, src_h)
     return src_x, src_y, crop, crop
 end
 
-local function draw_center_cross()
-    display.draw_line(display.width // 2 - 8, display.height // 2,
-                      display.width // 2 + 8, display.height // 2, "white")
-    display.draw_line(display.width // 2, display.height // 2 - 8,
-                      display.width // 2, display.height // 2 + 8, "white")
-end
-
-local function draw_motion_box(result, dst_x, dst_y, output_w, output_h, src_x, src_y, src_w, src_h)
+local function build_motion_overlay(result, output_w, output_h, src_x, src_y, src_w, src_h)
     if not result or output_w <= 0 or output_h <= 0 or src_w <= 0 or src_h <= 0 then
-        return
+        return nil
     end
 
     local box = result.raw_box or result.box
     if not box then
-        return
+        return nil
     end
 
     local left = clamp(box.left, src_x, src_x + src_w - 1)
@@ -103,7 +96,7 @@ local function draw_motion_box(result, dst_x, dst_y, output_w, output_h, src_x, 
     local top = clamp(box.top, src_y, src_y + src_h - 1)
     local bottom = clamp(box.bottom, src_y, src_y + src_h - 1)
     if right <= left or bottom <= top then
-        return
+        return nil
     end
 
     local scale_x = output_w / src_w
@@ -117,7 +110,13 @@ local function draw_motion_box(result, dst_x, dst_y, output_w, output_h, src_x, 
         y = output_h - y - h
     end
 
-    display.draw_rect(dst_x + x, dst_y + y, w, h, "yellow")
+    return {
+        x = x,
+        y = y,
+        width = w,
+        height = h,
+        color = "yellow",
+    }
 end
 
 local function init_display()
@@ -240,7 +239,9 @@ local function run()
         local display_ms = 0
         if (frame_index % ctx.display_every_n) == 0 then
             t0 = system.millis()
-            local output_w, output_h = display.draw_image(dst_x, dst_y, rgb565, {
+            local overlay_rect = build_motion_overlay(motion_result, src_w, src_h,
+                                                      src_x, src_y, src_w, src_h)
+            display.draw_image(dst_x, dst_y, rgb565, {
                 mode = "crop",
                 source = {
                     x = src_x,
@@ -251,10 +252,8 @@ local function run()
                 width = src_w,
                 height = src_h,
                 flip_y = ctx.display_flip_y,
+                overlay_rect = overlay_rect,
             })
-            draw_motion_box(motion_result, dst_x, dst_y, output_w or src_w, output_h or src_h,
-                            src_x, src_y, src_w, src_h)
-            draw_center_cross()
             display_ms = system.millis() - t0
         end
 
